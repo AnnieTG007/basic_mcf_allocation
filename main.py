@@ -532,9 +532,9 @@ def main(argv=None):
     parser.add_argument("--topology", choices=("topology1", "topology6", "topology7"), default="topology7")
     parser.add_argument("--algorithm", type=normalize_algorithm,
                         choices=(*ALGORITHMS, "ALL"), default="ALL")
-    parser.add_argument("--slots", type=int, default=100)
-    parser.add_argument("--arrival-rate", type=float, default=50)
-    parser.add_argument("--holding-time", type=float, default=0.5)
+    parser.add_argument("--slots", type=int, default=30)
+    parser.add_argument("--arrival-rate", type=float, default=15)
+    parser.add_argument("--holding-time", type=float, default=2)
     parser.add_argument("--k", type=int, default=1)
     parser.add_argument("--seed", type=int, default=53)
     parser.add_argument("--classical-channels", type=int, default=7)
