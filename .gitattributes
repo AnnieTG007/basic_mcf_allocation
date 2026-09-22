@@ -1,0 +1,10 @@
+# 固定文本换行，避免跨平台检出仅因换行改变源码哈希。
+* text=auto
+*.py text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+# 大型实验 JSON 保持原始字节，避免检出时改写全部换行。
+*.json -text
+*.xls binary
+*.xlsx binary
+*.png binary

@@ -1,0 +1,19 @@
+# Python 缓存和本地环境
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+
+# 编辑器和操作系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+~$*
+
+# 临时运行核查；正式 results/ 数据应保留
+.release_check/
+*.tmp
+*.log

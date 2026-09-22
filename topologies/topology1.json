@@ -1,0 +1,127 @@
+{
+  "name": "topology1",
+  "directed": false,
+  "nodes": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13
+  ],
+  "edges": [
+    {
+      "source": 0,
+      "target": 1,
+      "length_km": 52.5
+    },
+    {
+      "source": 0,
+      "target": 2,
+      "length_km": 75
+    },
+    {
+      "source": 0,
+      "target": 7,
+      "length_km": 90
+    },
+    {
+      "source": 1,
+      "target": 2,
+      "length_km": 30
+    },
+    {
+      "source": 1,
+      "target": 3,
+      "length_km": 30
+    },
+    {
+      "source": 2,
+      "target": 5,
+      "length_km": 75
+    },
+    {
+      "source": 3,
+      "target": 4,
+      "length_km": 30
+    },
+    {
+      "source": 3,
+      "target": 10,
+      "length_km": 75
+    },
+    {
+      "source": 4,
+      "target": 5,
+      "length_km": 65
+    },
+    {
+      "source": 4,
+      "target": 6,
+      "length_km": 30
+    },
+    {
+      "source": 5,
+      "target": 9,
+      "length_km": 52.5
+    },
+    {
+      "source": 5,
+      "target": 13,
+      "length_km": 75
+    },
+    {
+      "source": 6,
+      "target": 7,
+      "length_km": 37.5
+    },
+    {
+      "source": 7,
+      "target": 8,
+      "length_km": 37.5
+    },
+    {
+      "source": 8,
+      "target": 9,
+      "length_km": 40
+    },
+    {
+      "source": 8,
+      "target": 11,
+      "length_km": 15
+    },
+    {
+      "source": 8,
+      "target": 12,
+      "length_km": 15
+    },
+    {
+      "source": 10,
+      "target": 11,
+      "length_km": 25
+    },
+    {
+      "source": 10,
+      "target": 12,
+      "length_km": 37.5
+    },
+    {
+      "source": 11,
+      "target": 13,
+      "length_km": 40
+    },
+    {
+      "source": 12,
+      "target": 13,
+      "length_km": 15
+    }
+  ]
+}

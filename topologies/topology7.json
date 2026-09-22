@@ -1,0 +1,15 @@
+{
+  "name": "topology7",
+  "directed": false,
+  "nodes": [
+    0,
+    1
+  ],
+  "edges": [
+    {
+      "source": 0,
+      "target": 1,
+      "length_km": 10
+    }
+  ]
+}
