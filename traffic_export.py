@@ -1,9 +1,18 @@
 """把仿真状态和已算好的统计写成资源回放 JSON、Excel 工作簿与图表。
 
 由 traffic_scan 调用；不生成业务、不决定分配、不推进时间。输出路径由调用方给出。
-回放 kind=qkd_resource_timeline、schema_version=1，config 说明频率、芯分组、
+回放 kind=qkd_resource_timeline、schema_version=2，config 说明频率、芯分组、
 功率 dBm 和仿真时间单位。initial_occupancy 为初始状态，states 为每次资源
-改变后的 {time, occupancy}，包含预热段，终点清空仅用于结束回放。
+改变后的 {time, event, group_id, occupancy}，包含预热段。终点清空事件为
+horizon_release，带 group_ids，仅结束回放，不冒充自然离去、不改变仿真统计。
+
+本回放仅用于 --export-business 三芯实验。business_groups 每条记录是一组到达：
+group_id、source/destination、direction、arrival_time、holding_time、scheduled_end_time、
+status（accepted/blocked）、release_time、release_reason（natural/horizon 或 null）。
+allocation 对阻塞组为 null；接入组含 path、hops（link/direction/cores/physical_cores）、
+channel_index、frequency_hz 和 wavelength_nm。cores 为零起始仿真编号，physical_cores
+为物理芯号，不包含硬件端口。同组同方向三芯占用一致，两个方向可复用同一波长。
+负载单位为三芯业务组 Erlang，到达率按组/仿真时间计，功率为每芯每信道输入功率。
 
 occupancy 的维度为 [有向链路, 仿真芯, 经典信道]，链路顺序见 directed_links。
 -2 表示该方向不可用，-1 表示空闲，非负整数为占用业务 ID（0 也表示占用）。
@@ -26,7 +35,7 @@ import numpy as np
 import pandas as pd
 
 
-TRACE_SCHEMA_VERSION = 1
+TRACE_SCHEMA_VERSION = 2
 # 七芯专用映射：仿真 0..5 是外圈物理 2..7，仿真 6 是物理中心芯 1。
 CORE_TO_PHYSICAL = [2, 3, 4, 5, 6, 7, 1]
 
@@ -39,6 +48,8 @@ class TrafficRecorder:
     """
 
     def __init__(self, sim, *, seed, warmup):
+        if not sim.allocator.bind_three:
+            raise ValueError('Business trace requires a three-core experiment allocator')
         self.sim = sim
         self.links = sorted((int(a), int(b)) for a, b in sim.graph.to_directed().edges)
         self.link_index = {tuple(link): i for i, link in enumerate(self.links)}
@@ -52,7 +63,11 @@ class TrafficRecorder:
             mean_holding_time=float(sim.m_rou1), arrival_rate=float(sim.lambda1),
             offered_load_erlang=float(sim.lambda1 * sim.m_rou1),
             power_dbm=float(10 * math.log10(sim.launch_power / 1e-3)),
-            power_reference='per_classical_channel_at_fiber_input',
+            power_reference='per_core_per_classical_channel_at_fiber_input',
+            allocation_mode='three_core_bound', traffic_unit='three_core_business_group',
+            load_unit='Erlang of three-core business groups',
+            arrival_rate_unit='three-core groups per simulation unit',
+            direction_definition='forward: source < destination; backward: source > destination; independent resources',
             time_unit='simulation_unit', direction_mode='bidirectional',
             directed_links=[list(link) for link in self.links],
             link_lengths_m=[float(sim.a_m[a, b]) for a, b in self.links],
@@ -68,55 +83,91 @@ class TrafficRecorder:
         self.initial = deepcopy(self.occupancy)
         self.active = {}
         self.states = []
+        self.business_groups = []
 
     def record(self, event, *, blocked=False):
-        """记录成功到达或离去后的状态；忽略不改变资源的阻塞事件。
+        """记录每组到达及其真实资源变化；阻塞组无分配，也不生成状态变化。
 
-        内部信道索引减去量子信道数后才是回放的经典索引。保存完整矩阵副本，
-        使后续资源变化不会改写此前状态；用业务 ID 区分不同业务的占用。
+        业务组和 states 的 group_id 对应；离去沿用到达时的三芯成员。
+        每次事件核对回放与真实资源/功率，避免在导出阶段凭空复制三芯占用。
         """
         bid = int(event.m_id)
         arrival = bool(event.m_eventType['Arrival'])
-        if blocked:
-            return
         if arrival:
-            allocation = dict(
-                path=[int(n) for n in event.m_workPath],
-                cores=[int(c) for c in event.m_ocuppiedcore],
-                channel_index=int(event.m_ocuppiedwave - self.sim.quantum_wave_num))
-            service = dict(business_id=bid, allocation=allocation)
-            self.active[bid] = service
+            service = dict(group_id=bid, source=int(event.m_sourceNode), destination=int(event.m_destNode),
+                direction='forward' if event.m_sourceNode < event.m_destNode else 'backward',
+                arrival_time=float(event.m_time), holding_time=float(event.m_holdTime),
+                scheduled_end_time=float(event.m_time + event.m_holdTime),
+                status='blocked' if blocked else 'accepted', allocation=None,
+                release_time=None, release_reason=None)
+            self.business_groups.append(service)
+            if not blocked:
+                path = [int(n) for n in event.m_workPath]
+                frequency = float(self.sim.available_channel[event.m_ocuppiedwave])
+                service['allocation'] = dict(path=path,
+                    hops=[dict(link=[a, b], direction='forward' if a < b else 'backward',
+                               cores=[int(c) for c in cores],
+                               physical_cores=[CORE_TO_PHYSICAL[c] for c in cores])
+                          for a, b, cores in zip(path, path[1:], event.m_ocuppiedcore)],
+                    channel_index=int(event.m_ocuppiedwave - self.sim.quantum_wave_num),
+                    frequency_hz=frequency, wavelength_nm=299792458 / frequency * 1e9)
+                self.active[bid] = service
         else:
             service = self.active.pop(bid)
-        self._update(service, 'arrival' if arrival else 'leave')
-        self.states.append(dict(time=float(event.m_time), occupancy=deepcopy(self.occupancy)))
+            service.update(release_time=float(event.m_time), release_reason='natural')
+        if not blocked:
+            kind = 'arrival' if arrival else 'leave'
+            self._update(service, kind)
+            self.states.append(dict(time=float(event.m_time), event=kind,
+                                    group_id=bid, occupancy=deepcopy(self.occupancy)))
+        self._check_state()
 
     def _update(self, service, kind):
-        """更新记录器的占用：到达必须使用空闲位置，离去必须属于同一业务，否则报错。"""
+        """回放三芯归属一起更新；到达须空闲，离去须属于同一组，否则报错。"""
         allocation = service['allocation']
-        if allocation is not None:
-            path, cores, wave = allocation['path'], allocation['cores'], allocation['channel_index']
-            for a, b, core in zip(path, path[1:], cores):
+        wave = allocation['channel_index']
+        for hop in allocation['hops']:
+            a, b = hop['link']
+            for core in hop['cores']:
                 row = self.occupancy[self.link_index[a, b]][core]
-                expected = -1 if kind == 'arrival' else service['business_id']
+                expected = -1 if kind == 'arrival' else service['group_id']
                 if row[wave] != expected:
                     raise ValueError('Trace ownership disagrees with simulation lifecycle')
-                row[wave] = service['business_id'] if kind == 'arrival' else -1
+                row[wave] = service['group_id'] if kind == 'arrival' else -1
+
+    def _check_state(self):
+        """只读核查两方向的三芯一致性及回放占用；不会修复或改变仿真状态。"""
+        sim = self.sim
+        for index, (a, b) in enumerate(self.links):
+            resources = sim.m_resourceMap[a, b, :, sim.quantum_wave_num:]
+            powers = sim.P_link[a, b, :, sim.quantum_wave_num:]
+            recorded = np.asarray(self.occupancy[index])
+            actual = np.where(recorded >= 0, 2, np.where(recorded == -1, 1, 0))
+            cores = sim.classical_forward_cores if a < b else sim.classical_backward_cores
+            if (not np.array_equal(resources, actual)
+                    or not np.all(recorded[cores] == recorded[cores[0]])
+                    or not np.allclose(powers, np.where(resources == 2, sim.launch_power, 0),
+                                       rtol=1e-6, atol=0)):
+                raise ValueError('Three-core trace disagrees with actual resource or per-core power')
 
     def finish(self, metrics, source_hashes):
-        """返回回放字典，在精确终止时刻清空尚未离去的经典资源。
+        """返回回放；终点仍活跃组标记 horizon 释放，不修改仿真资源和统计。
 
-        只修改记录器，不改变仿真资源和统计；清空用于结束实验回放。
-        时间仍是仿真单位，映射为实际秒数由使用 JSON 的程序处理。
+        scheduled_end_time 保留自然结束计划，release_time 是回放中的释放时间。
+        时间为仿真单位，映射实际秒数由使用 JSON 的程序处理。
         """
+        self._check_state()
         for bid in sorted(self.active):
+            self.active[bid].update(release_time=float(self.sim.Ts), release_reason='horizon')
             self._update(self.active[bid], 'leave')
         if self.active:
-            self.states.append(dict(time=float(self.sim.Ts), occupancy=deepcopy(self.occupancy)))
+            self.states.append(dict(time=float(self.sim.Ts), event='horizon_release',
+                                    group_ids=sorted(self.active), occupancy=deepcopy(self.occupancy)))
         self.active.clear()
         return dict(schema_version=TRACE_SCHEMA_VERSION, kind='qkd_resource_timeline',
                     config=self.config, source_sha256=source_hashes,
                     traffic_sha256=metrics['traffic_sha256'], metrics=metrics,
+                    business_groups=self.business_groups,
                     initial_occupancy=self.initial, states=self.states)
 
 
@@ -328,23 +379,25 @@ def export_business_summary(output, runs, metadata, summary):
 
     每组输出 SKR/阻塞率趋势，另有两组并排的总览图。Excel 使用可编辑的
     数值横轴图，标准差列保留在表里；PNG 显示误差棒。重合曲线不人为平移。
+    阻塞率图不画阈值线。每张 SKR 图只标注 greedy 相对 FF 的最大正提升：
+    (greedy 的种子均值 / FF 的种子均值 - 1)。FF 非正或任一值缺失时不计算，
+    无正提升则不标；同分选横坐标较小的点。PNG 单图、总览和 Excel 共用该选择。
+    标注由本次数据自动生成，不写死负载或百分比。
     """
     import openpyxl
     from openpyxl.chart import Reference, ScatterChart, Series
+    from openpyxl.chart.label import DataLabelList
+    from openpyxl.chart.legend import LegendEntry
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     from matplotlib.ticker import PercentFormatter
 
-    limit = metadata['blocking_rate_limit']
-    for rows in summary.values():
-        for row in rows:
-            row['blocking_rate_limit'] = limit
     specs = [
-        ('load_scan', 'LoadSweep', 'load_erlang', 'Offered traffic (Erlang)',
-         f"Load sweep | {metadata['fixed_power_dbm']:g} dBm/channel"),
-        ('power_scan', 'PowerSweep', 'power_dbm', 'Power per channel (dBm)',
-         f"Power sweep | {metadata['fixed_load_erlang']:g} Erlang offered")]
+        ('load_scan', 'LoadSweep', 'load_erlang', 'Three-core group traffic (Erlang)',
+         f"Load sweep | {metadata['fixed_power_dbm']:g} dBm/core/channel"),
+        ('power_scan', 'PowerSweep', 'power_dbm', 'Power per core per channel (dBm)',
+         f"Power sweep | {metadata['fixed_load_erlang']:g} Erlang of three-core groups")]
     series = [('ff', 'first-fit', '2563EB', 'o', '-'),
               ('greedy', 'greedy_min_noise', 'D97706', 's', '--')]
     path = output / 'skr_summary.xlsx'
@@ -363,7 +416,7 @@ def export_business_summary(output, runs, metadata, summary):
         upper = max((r[prefix + '_' + metric] + (r[prefix + '_' + sd_key] or 0)
                      for rows in summary.values() for r in rows for prefix, *_ in series
                      if r[prefix + '_' + metric] is not None), default=0)
-        upper = min(1, max(limit, upper) * 1.15) if blocking else max(1, upper * 1.08)
+        upper = min(1, max(.01, upper) * 1.15) if blocking else max(1, upper * 1.08)
         fig, axes = plt.subplots(1, 2, figsize=(12, 4.8), layout='constrained')
         for ax, (group, sheet_name, x_key, x_label, title) in zip(axes, specs):
             sheet = workbook[sheet_name]
@@ -400,20 +453,47 @@ def export_business_summary(output, runs, metadata, summary):
                     if all(v is not None for v in sd):
                         target.errorbar(x, y, yerr=sd, fmt='none', capsize=3, color='#' + color)
             if blocking:
-                threshold = Series(Reference(sheet, min_col=headers.index('blocking_rate_limit') + 1,
-                                             min_row=2, max_row=sheet.max_row), x_values,
-                                   title=f'{limit:.0%} experiment limit')
-                threshold.graphicalProperties.line.solidFill = '777777'
-                threshold.graphicalProperties.line.prstDash = 'dash'
-                chart.series.append(threshold)
                 chart.y_axis.numFmt = '0%'
                 for target in (ax, single_ax):
-                    target.axhline(limit, color='#777777', ls=':', label=f'{limit:.0%} experiment limit')
                     target.yaxis.set_major_formatter(PercentFormatter(1))
                     if all(r['ff_blocking_rate'] is not None and r['ff_blocking_rate'] == r['greedy_blocking_rate']
                            for r in summary[group]):
                         target.text(.03, .95, 'Algorithm curves overlap', transform=target.transAxes,
                                     va='top', fontsize=9, color='#555555')
+            else:
+                comparable = [(index, row) for index, row in enumerate(summary[group])
+                              if row['ff_skr_kbit_s'] is not None and row['ff_skr_kbit_s'] > 0
+                              and row['greedy_skr_kbit_s'] is not None
+                              and row['greedy_skr_kbit_s'] > row['ff_skr_kbit_s']]
+                if comparable:
+                    index, best = max(comparable, key=lambda pair:
+                        (pair[1]['greedy_skr_kbit_s'] / pair[1]['ff_skr_kbit_s'] - 1, -pair[1][x_key]))
+                    x = best[x_key]
+                    low, high = best['ff_skr_kbit_s'], best['greedy_skr_kbit_s']
+                    label = f'Max SKR gain: +{(high / low - 1):.1%}'
+                    # 两端锚定同一工况下的真实均值；文字向图内偏移，避免边界裁切。
+                    midpoint = (min(r[x_key] for r in summary[group])
+                                + max(r[x_key] for r in summary[group])) / 2
+                    right_half = x > midpoint
+                    for target in (ax, single_ax):
+                        target.annotate('', xy=(x, high), xytext=(x, low),
+                                        arrowprops=dict(arrowstyle='<->', color='#555555', lw=1.2))
+                        target.annotate(label, xy=(x, (low + high) / 2),
+                                        xytext=(-10 if right_half else 10, 0), textcoords='offset points',
+                                        ha='right' if right_half else 'left', va='center', fontsize=9,
+                                        bbox=dict(facecolor='white', edgecolor='none', alpha=.85, pad=2))
+                    # Excel 用一个不可见的单点系列承载同一百分比标签，隐藏它的图例项。
+                    excel_row = index + 2
+                    annotation = Series(Reference(sheet, min_col=headers.index('greedy_skr_kbit_s') + 1,
+                                                  min_row=excel_row, max_row=excel_row),
+                                        Reference(sheet, min_col=headers.index(x_key) + 1,
+                                                  min_row=excel_row, max_row=excel_row), title=label)
+                    annotation.graphicalProperties.line.noFill = True
+                    annotation.marker.symbol = 'none'
+                    annotation.dLbls = DataLabelList(showSerName=True, showVal=False,
+                                                    showLegendKey=False, dLblPos='b')
+                    chart.legend.legendEntry = [LegendEntry(idx=len(chart.series), delete=True)]
+                    chart.series.append(annotation)
             sheet.add_chart(chart, f'A{sheet.max_row + 4 + 28 * metric_index}')
             for target in (ax, single_ax):
                 target.set(xlabel=x_label, ylabel=y_label, title=title, ylim=(0, upper))

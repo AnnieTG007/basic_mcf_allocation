@@ -5,6 +5,7 @@
 本模块不另造业务或占用资源。完成的统计交给 traffic_export 写 JSON、Excel 和图。
 
 负载 A=到达率*平均保持时间，单位 Erlang，表示全网络输入负载而非每链路负载。
+--scan-load 按单芯业务计数；仅 --export-business 按三芯业务组计数。
 扫描用 A/holding_time 设置到达率，不使用 --arrival-rate。
 统计窗口为 [warmup, slots)，slots 包含预热；每个预热后的时隙末采样一次。
 SKR（秘密密钥率）先按每量子信道截为非负，再对无向链路求和，单位 bit/s。
@@ -25,7 +26,7 @@ import time
 import numpy as np
 import pandas as pd
 
-from algorithm import ALGORITHMS
+from algorithm import ALGORITHMS, ResourceAllocator
 from traffic_export import (TrafficRecorder, export_business_summary,
                             export_scan_results, write_trace)
 
@@ -41,10 +42,12 @@ def measure_run(sim, warmup, event_recorder=None):
     
     到达/接入/阻塞数仅计入窗口内的到达，阻塞率=阻塞数/到达数；没有到达时
     为 None，不能解释为零。承载负载是已接入业务持续时间与窗口的交集之和
-    除以窗口长度，包含预热期间到达但仍活跃的业务。每条多跳业务按跳数累计
-    占用时间，除以窗口长度和初始可用经典资源数得到 channel_utilization。
+    除以窗口长度，包含预热期间到达但仍活跃的业务。每条业务按实际占用的芯数逐跳累计
+    占用时间（普通仿真每跳一芯，实验业务组每跳三芯），再除以窗口长度和初始
+    可用经典资源数得到 channel_utilization。
     
-    active_services 是当时活跃业务数，occupied_channels 是占用的链路信道数；
+    active_services 是当时活跃业务数（实验为组数）；occupied_channels 按链路、芯、
+    信道逐格计数，三芯组每跳占三格，capacity 也按格计数；
     零 SKR 比例是各时隙“零 SKR 量子信道数/全部量子信道数”的平均。
     fallback_rate 仅用于 GREEDY_MIN_NOISE，分母为窗口内成功接入数，分子为
     其中选择等级 2 的次数；不是 FWM 功率占比。可选 recorder 记录全部资源变化。
@@ -78,7 +81,7 @@ def measure_run(sim, warmup, event_recorder=None):
                 duration = max(0.0, min(sim.Ts, event.m_time + event.m_holdTime)
                                - max(warmup, event.m_time))
                 carried_time += duration
-                occupied_time += duration * (len(event.m_workPath) - 1)
+                occupied_time += duration * sum(np.size(cores) for cores in event.m_ocuppiedcore)
                 if measured and sim.allocator.noise_policy is not None:
                     tiers[sim.allocator.noise_policy.last_tier] += 1
         else:
@@ -301,12 +304,16 @@ def run_business_export(args, build_simulation, base):
     """运行固定 10 km 双节点实验，返回批次索引并输出资源状态回放。
     
     ALL 在本模式仅运行 FF 与 GREEDY_MIN_NOISE；固定 C35 量子信道和跳过 C33
-    的七个经典候选。负载组默认 10..40 Erlang、固定 10.5 dBm；功率组默认
-    7/8/9/10/10.5 dBm、固定 30 Erlang，可用 loads/powers/fixed-load/fixed-power 修改。
+    的七个经典候选。仅本入口开启三芯绑定；到达/阻塞/承载负载按业务组统计，
+    每芯每信道功率不变，普通运行与 --scan-load 仍按单芯业务运行。
+    负载组默认 3/5/7/8/10/12/13 Erlang、固定 10.5 dBm；功率组默认
+    7/8/9/10/10.5 dBm、固定 10 Erlang，可用 loads/powers/fixed-load/fixed-power 修改。
+    默认负载由旧单芯负载除以三后就近取整，以近似保持总芯信道需求；显式指定
+    loads/fixed-load 已是三芯组负载，不再缩放，也不承诺与旧结果的噪声或阻塞率相等。
     相同负载、种子在各算法和功率下必须有相同到达序列。交叉工况在两组各留一份。
     
     5% 阻塞率是人为选定的实验参考线，不是通用标准，也不是算法接入限制；
-    现存材料不足以保证任意种子下 30 Erlang 都低于此线。输出目录必须为空。
+    不保证默认工况或任意指定负载均低于此线。输出目录必须为空。
     manifest.json 最后生成，用作完成批次的索引；回放、图表和工作簿生成失败时
     可能留有不完整文件，应换新目录重跑，不把目录存在视作成功。
     """
@@ -322,9 +329,14 @@ def run_business_export(args, build_simulation, base):
         raise ValueError('实验业务导出使用 C35 量子信道和跳过 C33 的七个经典信道')
     if args.algorithm not in ('ALL', 'FF', 'GREEDY_MIN_NOISE'):
         raise ValueError('实验业务仅支持 first-fit/FF 和 GREEDY_MIN_NOISE')
+    if args.core_layout is not None:
+        raise ValueError('三芯实验保留各算法默认分组，不支持 --core-layout')
     loads, seeds, warmup, _ = scan_settings(args)
+    if args.loads is None:
+        loads = [3, 5, 7, 8, 10, 12, 13]
+    fixed_load = 10 if args.fixed_load is None else args.fixed_load
     powers = args.powers if args.powers is not None else [7, 8, 9, 10, 10.5]
-    if not math.isfinite(args.fixed_load) or args.fixed_load <= 0:
+    if not math.isfinite(fixed_load) or fixed_load <= 0:
         raise ValueError('fixed-load 必须为有限正数')
     if not powers or len(powers) != len(set(powers)):
         raise ValueError('powers 必须非空且不能重复')
@@ -338,8 +350,8 @@ def run_business_export(args, build_simulation, base):
     output.mkdir(parents=True, exist_ok=True)
     hashes = source_hashes(base, 'topology7', args.raman_file)
     experiments = [('load_scan', load, args.fixed_power) for load in loads]
-    experiments += [('power_scan', args.fixed_load, power) for power in sorted(powers)]
-    metadata = dict(loads_erlang=loads, powers_dbm=sorted(powers), fixed_load_erlang=args.fixed_load,
+    experiments += [('power_scan', fixed_load, power) for power in sorted(powers)]
+    metadata = dict(loads_erlang=loads, powers_dbm=sorted(powers), fixed_load_erlang=fixed_load,
                     fixed_power_dbm=args.fixed_power, seeds=seeds, slots=args.slots, warmup=warmup,
                     holding_time=args.holding_time, length_km=10, algorithms=algorithms,
                     skr_definition='Time mean of slot-end total SKR after warmup; each quantum channel clipped at zero; undirected links counted once',
@@ -348,11 +360,16 @@ def run_business_export(args, build_simulation, base):
                     gain_definition='Ratio of seed mean SKR minus one; blank if baseline absent or zero',
                     blank_definition='Unavailable or undefined, not zero',
                     timing='Full warmup and resource transitions retained; experiment duration maps linearly to simulation time',
-                    power_reference='Per classical channel at fiber input, dBm', source_sha256=hashes)
+                    power_reference='Per core per classical channel at fiber input, dBm', source_sha256=hashes,
+                    allocation_mode='three_core_bound', traffic_unit='three_core_business_group',
+                    load_definition='Erlang of three-core business groups; A = group arrival rate * mean holding time',
+                    default_load_scaling='Legacy single-core loads / 3, rounded to nearest integer; explicit loads are already group loads',
+                    carried_load_definition='Integral of active accepted groups / observation duration',
+                    resource_definition='capacity and occupied_channels count physical core-channel slots; utilization includes all three cores')
     metadata.update(blocking_rate_limit=.05,
-                    blocking_definition='Blocked classical arrivals / offered arrivals in [warmup, slots); not packet loss or BER',
+                    blocking_definition='Blocked three-core group arrivals / offered group arrivals in [warmup, slots); not packet loss or BER',
                     blocking_limit_definition='User-selected experiment target, strictly below 5%; not an enforced admission rule or universal standard')
-    manifest = dict(schema_version=2, kind='qkd_business_experiments',
+    manifest = dict(schema_version=3, kind='qkd_business_experiments',
                     description='10 km; paired traffic across algorithms and powers; full warmup retained',
                     config=metadata, files=[])
     references, runs = {}, []
@@ -365,6 +382,9 @@ def run_business_export(args, build_simulation, base):
                     classical_channels=7, quantum_channels=1,
                     launch_power=1e-3 * 10 ** (power / 10), link_length_km=10,
                     core_layout=args.core_layout, skip_c33=True)
+                # 只替换本实验实例的分配器；共用 main 的事件循环和三芯原子占用/释放。
+                sim.allocator = ResourceAllocator(algorithm, sim.classical_forward_cores,
+                    sim.classical_backward_cores, None, sim.quantum_scorer, bind_three=True)
                 recorder = TrafficRecorder(sim, seed=seed, warmup=warmup)
                 metrics, _ = measure_run(sim, warmup, event_recorder=recorder)
                 key = (load, seed)

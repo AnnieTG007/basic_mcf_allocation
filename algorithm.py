@@ -3,7 +3,8 @@
 由 main.ClassicalService 通过 ResourceAllocator 调用。输入资源和功率数组
 为 [源节点, 目的节点, 芯, 信道]，资源状态 1 表示可用，2 表示经典占用，
 3 表示量子保留；功率 W、距离 m、实际频率 Hz。返回 (各跳芯列表, 信道索引)，
-无可用分配时为 (None, -1)。全路径使用同一信道，中间节点可以换芯。
+无可用分配时为 (None, -1)。普通仿真全路径使用同一信道，中间节点可以换芯。
+仅实验导出启用 bind_three，此时每跳返回固定方向组的三芯列表，三芯同时加载。
 
 FF（first-fit，遇到可用资源就选）和 CQLI 共用搜索，但默认芯方向分组不同。
 SCWA 比较经典芯内的四波混频（FWM）噪声增量；它沿用 Kong 2022 的贪心
@@ -152,7 +153,8 @@ class ResourceAllocator:
 
     不持有仿真对象或资源快照，不修改传入数组。
     """
-    def __init__(self, algorithm, forward_cores, backward_cores, scorer, quantum_scorer=None):
+    def __init__(self, algorithm, forward_cores, backward_cores, scorer, quantum_scorer=None,
+                 *, bind_three=False):
         self.algorithm = normalize_algorithm(algorithm)
         if self.algorithm not in ALGORITHMS:
             raise ValueError(f"Unknown algorithm: {algorithm}")
@@ -160,6 +162,12 @@ class ResourceAllocator:
             raise ValueError("SCWA requires a supplied FWM scorer")
         self.core_f = tuple(forward_cores)
         self.core_b = tuple(backward_cores)
+        # 仅实验导出开启；普通仿真和负载扫描仍逐跳选单芯。
+        self.bind_three = bind_three
+        if bind_three and (self.algorithm not in ('FF', 'GREEDY_MIN_NOISE')
+                           or len(self.core_f) != 3 or len(self.core_b) != 3
+                           or len(set(self.core_f + self.core_b)) != 6):
+            raise ValueError('Three-core experiments require FF/greedy and two disjoint three-core groups')
         self.scorer = scorer
         if self.algorithm == "GREEDY_MIN_NOISE" and quantum_scorer is None:
             raise ValueError(f"{self.algorithm} requires a quantum receiver scorer")
@@ -170,13 +178,57 @@ class ResourceAllocator:
     def allocate(self, path, launch_power, *, resources, powers, distances):
         """返回 (各跳芯列表, 共同信道索引)，失败为 (None, -1)。
         
+        默认每跳返回单芯编号；仅 bind_three=True 时每跳返回三个芯的列表。
         launch_power/powers 为 W，distances 为 m；不修改输入数组，实际占用/释放由 main 处理。
         """
+        if self.bind_three:
+            return self._bound_three(path, launch_power, resources, powers, distances)
         if self.noise_policy is not None:
             return self.noise_policy.allocate(path, launch_power, resources, powers, distances)
         if self.algorithm == "SCWA":
             return self._scwa(path, launch_power, resources, powers, distances)
         return self._first_fit(path, resources)
+
+    def _bound_three(self, path, launch_power, resources, powers, distances):
+        """实验专用：返回 (逐跳三芯成员列表, 共同信道索引)，失败为 (None, -1)。
+
+        每跳按节点号选择方向组，三芯全部空闲才可接入，反向资源独立。
+        FF 按原信道顺序选第一个可行波长。greedy 沿用安全等级及同分排序，
+        但安全条件须覆盖三芯；噪声增量逐芯计算后求和，保留实际邻接耦合差异。
+        现有物理模型按经典芯相加，因此这等于三芯同时加载的增量，不是单芯乘三。
+        每芯每信道均加载 launch_power W；仅评分副本，main 的事件负责实际占用。
+        """
+        policy = self.noise_policy
+        if policy is not None:
+            policy.last_tier = None
+        if len(path) < 2:
+            return None, -1
+        if len(set(path)) != len(path):
+            raise ValueError('Three-core experiments require a simple path')
+        if not np.isfinite(launch_power) or launch_power <= 0:
+            raise ValueError('Launch power must be finite and positive')
+        groups = [list(self.core_f if a < b else self.core_b) for a, b in zip(path, path[1:])]
+        best_key, best = None, (None, -1)
+        for wave in range(resources.shape[-1]):
+            if not all(np.all(resources[a, b, cores, wave] == 1)
+                       for a, b, cores in zip(path, path[1:], groups)):
+                continue
+            if policy is None:
+                return groups, wave
+            candidates = [policy._candidate(a, b, c, wave, launch_power, resources, powers, distances[a, b])
+                          for a, b, cores in zip(path, path[1:], groups) for c in cores]
+            raman = sum(c['raman'] for c in candidates)
+            separation = min(c['separation'] for c in candidates)
+            if all(c['safe'] for c in candidates):
+                tier = 0 if all(c['preferred'] for c in candidates) else 1
+                key = (tier, raman, sum(c['spectral'] for c in candidates), -separation, wave)
+            else:
+                key = (2, -separation, sum(c['noise'] for c in candidates), raman, wave)
+            if best_key is None or key < best_key:
+                best_key, best = key, (groups, wave)
+        if policy is not None:
+            policy.last_tier = None if best_key is None else best_key[0]
+        return best
 
     def _first_fit(self, path, resources):
         """FF/CQLI 按候选频率顺序、仿真芯编号升序搜索。

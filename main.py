@@ -57,7 +57,8 @@ class Event:
     """一条到达或离去事件；同一业务的两条事件共享 ID 和分配信息。
     
     m_time/m_holdTime 使用仿真时间单位；m_ocuppiedwave 是唯一信道索引，
-    m_ocuppiedcore 是按路径各跳排列的芯编号。离去事件在成功接入后才建立。
+    m_ocuppiedcore 按路径各跳排列：普通仿真是单芯编号，实验导出是三芯列表。
+    同一索引写入对应的全部芯，每芯功率均为 P；离去事件在成功接入后才建立。
     """
     def __init__(self, launch_power):
         self.m_eventType = pd.Series([0, 0], index=['Arrival', 'End'])                         # 业务的类型(到达或离去)
@@ -306,8 +307,8 @@ class ClassicalService:
                 event.m_ocuppiedcore = core_list
                 # 标记链路属性为正在被占用
                 for it in range(len(event.m_workPath) - 1):  # link, link, core, wave
-                    self.m_resourceMap[event.m_workPath[it]][event.m_workPath[it + 1]][event.m_ocuppiedcore[it]][event.m_ocuppiedwave] = 2
-                    self.P_link[event.m_workPath[it]][event.m_workPath[it + 1]][event.m_ocuppiedcore[it]][event.m_ocuppiedwave] = event.P
+                    self.m_resourceMap[event.m_workPath[it], event.m_workPath[it + 1], event.m_ocuppiedcore[it], event.m_ocuppiedwave] = 2
+                    self.P_link[event.m_workPath[it], event.m_workPath[it + 1], event.m_ocuppiedcore[it], event.m_ocuppiedwave] = event.P
                 # 生成该业务的离去事件
                 self.m_pq.append(self.generateLeavingevent(event))
 
@@ -324,14 +325,15 @@ class ClassicalService:
         if event.m_eventType['End'] == 1:
 
             for it in range(len(event.m_workPath) - 1):
-                self.m_resourceMap[event.m_workPath[it]][event.m_workPath[it + 1]][event.m_ocuppiedcore[it]][event.m_ocuppiedwave] = 1
-                self.P_link[event.m_workPath[it]][event.m_workPath[it + 1]][event.m_ocuppiedcore[it]][event.m_ocuppiedwave] = 0
+                self.m_resourceMap[event.m_workPath[it], event.m_workPath[it + 1], event.m_ocuppiedcore[it], event.m_ocuppiedwave] = 1
+                self.P_link[event.m_workPath[it], event.m_workPath[it + 1], event.m_ocuppiedcore[it], event.m_ocuppiedwave] = 0
             self.m_pq.remove(event)  # 删除当前事件
 
 
     def showPath_core_exchange(self,event):
-        """按候选路径顺序尝试分配，返回 (逐跳芯编号列表, 全路径共同信道索引)。
+        """按候选路径顺序尝试分配，返回 (逐跳芯分配列表, 全路径共同信道索引)。
         
+        普通仿真每跳为单芯编号，实验导出每跳为三芯列表；分配规则由 allocator 决定。
         中间节点允许换芯，但不允许换频率；第一条能接入的路径即被选中，
         不跨路径比较噪声。成功时 event.m_workPath 为选中路径，失败返回 (None, -1)。
         """
@@ -548,7 +550,7 @@ def main(argv=None):
                         default=base / "Ramancrosssection25GHz（25GHz间隔）.xls")
     parser.add_argument("--scan-load", action="store_true", help="扫描 A=lambda*E[H] 并导出 Excel、JSON、PNG/SVG")
     parser.add_argument("--loads", type=float, nargs="+", default=None,
-                        help="扫描负载/Erlang，默认 10 15 20 25 30 35 40")
+                        help="负载/Erlang；普通扫描默认 10 15 20 25 30 35 40，三芯实验默认 3 5 7 8 10 12 13")
     parser.add_argument("--seeds", type=int, nargs="+", default=None,
                         help="扫描种子列表；省略时仅使用 --seed")
     parser.add_argument("--warmup", type=int, default=None, help="扫描预热时隙，默认10")
@@ -558,8 +560,8 @@ def main(argv=None):
     parser.add_argument("--save-samples", action="store_true", help="Excel 中附加预热后的逐时隙样本（JSON始终保留）")
     parser.add_argument("--export-business", action="store_true", help="导出负载/功率两组业务回放 JSON，仅 FF 与 GREEDY_MIN_NOISE")
     parser.add_argument("--powers", type=float, nargs='+', help="业务导出的功率扫描点，默认 7 8 9 10 10.5 dBm")
-    parser.add_argument("--fixed-load", type=float, default=30, help="功率扫描的固定负载/Erlang（默认 30）")
-    parser.add_argument("--fixed-power", type=float, default=10.5, help="负载扫描的固定每信道功率/dBm")
+    parser.add_argument("--fixed-load", type=float, default=None, help="实验功率扫描的固定三芯组负载/Erlang（默认 10）")
+    parser.add_argument("--fixed-power", type=float, default=10.5, help="实验负载扫描的固定每芯每信道功率/dBm")
     args = parser.parse_args(argv)
     if args.export_business:
         from traffic_scan import run_business_export
@@ -567,7 +569,7 @@ def main(argv=None):
             return run_business_export(args, build_simulation, base)
         except ValueError as exc:
             parser.error(str(exc))
-    if args.powers is not None or args.fixed_load != 30 or args.fixed_power != 10.5:
+    if args.powers is not None or args.fixed_load is not None or args.fixed_power != 10.5:
         parser.error("--powers/--fixed-load/--fixed-power 需要 --export-business")
     if args.scan_load:
         from traffic_scan import run_load_scan

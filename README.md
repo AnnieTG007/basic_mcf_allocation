@@ -21,7 +21,7 @@ python main.py --algorithm greedy_min_noise --slots 100 --seed 53
 # 扫描负载并比较四种算法
 python main.py --scan-load --algorithm ALL --loads 10 20 30 --seeds 53 54 55 --slots 100 --warmup 10
 
-# 导出 FF 与 GREEDY_MIN_NOISE 的负载/功率实验和资源状态回放
+# 导出 FF 与 GREEDY_MIN_NOISE 的三芯绑定实验（仅此模式启用）
 python main.py --export-business --slots 100 --warmup 10 --seed 53
 
 # 查看所有参数
