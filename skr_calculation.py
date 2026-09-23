@@ -7,7 +7,8 @@
 不可用/空闲经典/占用经典/量子保留。
 
 BB84_SKR 和 calculate_SKR_all 保留可为负的公式原值；扫描使用
-QuantumLinkScorer.metrics，将每量子信道 SKR 各自截为非负再求和。
+QuantumLinkScorer.metrics 的 raw_skr，除以所选链路量子信道数后取时间平均。
+metrics 同时保留非负 skr 供资源评分使用，不将它作为导出的参考 SKR。
 只评估节点号小到大的量子接收方向，经典噪声同时包括两个传播方向。
 """
 from dataclasses import dataclass
@@ -217,7 +218,8 @@ class QuantumLinkScorer:
         forward 对应小节点到大节点的量子接收方向。返回 skr（逐信道非负后求和）、
         raw_skr（公式原值之和）、拉曼/FWM 功率 W、每门噪声计数之和及量子信道计数。
         no_fwm_skr 仅在同一资源状态中去掉 FWM；zero_noise_skr 去掉外加噪声但保留
-        暗计数，二者都是 bit/s 的假设计算，不是其他算法实际分配的结果。
+        暗计数；这两项辅助指标逐信道截零，区别于导出的原始 skr/raw_skr。
+        二者都是 bit/s 的假设计算，不是其他算法实际分配的结果。
         """
         result = dict(skr=0.0, raw_skr=0.0, no_fwm_skr=0.0, zero_noise_skr=0.0,
                       raman_w=0.0, fwm_w=0.0, noise_counts=0.0,

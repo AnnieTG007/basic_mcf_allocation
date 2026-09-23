@@ -1,19 +1,21 @@
-"""计算经典光对量子信道的拉曼散射和四波混频（FWM）噪声，供 SKR 计算使用。
+"""计算共纤噪声：量子端拉曼/四波混频（FWM），以及经典端参考 OSNR 所需的串扰与固定噪声底。
 
-本模块由 main 构建物理模型，skr_calculation 调用；不读文件、不分配资源。
+本模块由 main 构建模型，skr_calculation 调用量子噪声，main 调用经典 OSNR；
+不读文件、不分配资源。
 频率 Hz、距离 m、发射和噪声功率 W，距离可传数组以同时计算多个长度。
 正式量子评估只汇总最近邻/次近邻经典芯的前后向拉曼与 FWM，远芯被截断为零。
 FWM 仅计算离散频率 fi+fj-fk，未模拟带内展宽、频率漂移或跨芯泵浦混合。
-SCWA 算法另用经典芯内 FWM 总功率评分，这不同于量子端噪声。
+经典 OSNR 只使用参考同频芯间串扰及 3.21e-9 W 噪声底；独立 ClassicalFWMScorer 可汇总候选频点功率，
+正式分配入口不调用该独立接口。
 
-MulticoreFiber_Multi_Att、XT（线性芯间串扰）和 wave 为独立计算接口，
-正式入口不使用它们；XT 不加入量子噪声汇总，且 hij 单位为 km^-1。
+MulticoreFiber_Multi_Att 和 wave 是正式入口不使用的独立接口。
+XT（线性芯间串扰）用于经典 OSNR，不加入量子噪声汇总；hij 单位为 km^-1。
 现有公式缺少完整可核查的出处记录，参数和近似沿用原实现，不能据此声称
 已完成实验标定。下方注释标明已知限制，不借注释整理改变数值模型。
 """
 from functools import lru_cache, partial
 from itertools import permutations, combinations
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 
 import numpy as np
@@ -91,7 +93,7 @@ class MulticoreFiber:
         beta 为相位失配量 m^-1，z 为正距离数组 m。D=3/6 分别用于两泵浦
         频率相同/不同，判断容差为 1 MHz。这里的 eta 将通常距离振荡项
         sin(beta*z/2)^2 固定为 1，是原实现保留的包络式近似，不是振荡平均值；
-        不能将此结果当作含相位振荡的精确解。SCWA 评分使用此公式。
+        不能将此结果当作含相位振荡的精确解。经典 OSNR 的芯内 FWM 使用此公式。
         """
         if np.abs(fi - fj) < 10 ** 6:
             D = 3  # 如果相等，D=3
@@ -359,7 +361,7 @@ class MulticoreFiber_Multi_Att(MulticoreFiber):
     
     att/att_c/att_q 为 m^-1。注意后向芯间拉曼函数虽然接收 att_c/att_q，
     实际仍使用实例固定 loss_c/loss_q；这条旧接口不具备完整的逐信道衰减能力。
-    芯内 FWM 则保留正弦振荡项，与基类 SCWA 使用的包络式近似不同。
+    芯内 FWM 则保留正弦振荡项，与基类的包络式近似不同。
     """
     def __init__(self, params):
         super().__init__(params)
@@ -555,6 +557,53 @@ class ClassicalFWMScorer:
         return self._cached(tuple(selected), float(distance))
 
 
+
+# 经典串扰参数沿用参考 XT.py；功率接口仅使用 loss_per_km 与 rayleigh_per_km。
+# 最近邻/次近邻耦合为 1e-6/1e-7 km^-1，独立于量子拉曼/FWM 的 hmn（m^-1）。
+# 功率接口仅使用前两个参数；其余值保留参考 XT.py 的探测参数约定。
+XT_PARAMS = XTParameters(0.2 / 4.343, 1e-3, 0.5e-9, 0.1, 8.0,
+                         1550e-9, 6.62e-34, 3e8)
+
+class ClassicalOSNRScorer:
+    """只读计算所选链路的参考经典 OSNR，不参与路由或分配。
+
+    参考业务入口先对占用信道的串扰求均值，再加固定噪声底 3.21e-9 W。
+    单链路用实际长度、实际发射功率和一跳；两个经典方向的占用格共同平均。
+    保留参考 calculate_noise_core 的判断：反向串扰仅在受扰芯的反向同频
+    功率非零时加入，即使邻芯反向有光也不绕过此判断。FWM/拉曼不计入经典
+    OSNR；量子 SKR 的拉曼/FWM 仍由量子评分器计算。空闲返回 None。
+    """
+    def __init__(self):
+        self.statistics = {}
+
+    def __call__(self, resources, powers, distances, first, secondary, link):
+        """数组维度 [源, 目的, 芯, 信道]，距离 m，功率 W；返回线性比值。"""
+        signal_sum = xt_sum = 0.0
+        count = zero_count = 0
+        a, b = link
+        length = float(distances[a, b])
+        for i, j in ((a, b), (b, a)):
+            for c, w in np.argwhere(resources[i, j] == 2):
+                noise = 0.0
+                for neighbors, coupling in ((first[c], 1e-6), (secondary[c], 1e-7)):
+                    for neighbor in neighbors:
+                        if powers[i, j, c, w] != 0:
+                            noise += forward_P_XT(coupling, length, float(powers[i, j, neighbor, w]), XT_PARAMS)
+                        if powers[j, i, c, w] != 0:
+                            noise += backward_P_XT(coupling, length, float(powers[j, i, neighbor, w]), XT_PARAMS)
+                signal_sum += float(powers[i, j, c, w]) * 10 ** (-length * 0.2 * 1e-4)
+                xt_sum += noise
+                count += 1
+                zero_count += int(noise == 0)
+        noise_sum = xt_sum + count * 3.21e-9
+        self.statistics = dict(
+            signal_sum_w=signal_sum, noise_sum_w=noise_sum, xt_sum_w=xt_sum,
+            floor_sum_w=count * 3.21e-9,
+            noise_per_channel_w=noise_sum/count if count else None,
+            occupied_channels=count, zero_noise_channels=zero_count)
+        return signal_sum/noise_sum if count else None
+
+
 def noise_power_to_counts(power, frequencies, detector):
     """将噪声功率(W)换算为每探测门噪声光子数（含探测效率，不含暗计数）。
 
@@ -607,7 +656,7 @@ def calculate_noise_core(i, j, c, m_resourceMap, P_link, m_dis,
         noise_model.secondary_fiber, secondary_neighbor[c], active_forward, active_backward,
         frequencies, quantum_frequencies, z, noise_model.raman)
 
-    # 保留原先先拉曼、后 FWM 的浮点求和顺序，避免影响 SCWA/SKR 数值回归。
+    # 保留原先先拉曼、后 FWM 的浮点求和顺序，避免影响量子噪声/SKR 的浮点结果。
     noise_sum = (first[0] + first[1] + secondary[0] + secondary[1]
                  + first[2] + first[3] + secondary[2] + secondary[3])
     noise_sum = np.asarray(noise_sum, dtype=float).reshape(-1)

@@ -6,10 +6,13 @@
 改变后的 {time, event, group_id, occupancy}，包含预热段。终点清空事件为
 horizon_release，带 group_ids，仅结束回放，不冒充自然离去、不改变仿真统计。
 
-本回放仅用于 --export-business 三芯实验。business_groups 每条记录是一组到达：
+本回放用于 --export-business 全网三芯实验，仅保留经过所选链路的已接入业务。
+完整路由保留在 path，hops 和 occupancy 只含所选链路；全网阻塞统计在 metrics。
+business_groups 每条记录是一组到达：
 group_id、source/destination、direction、arrival_time、holding_time、scheduled_end_time、
-status（accepted/blocked）、release_time、release_reason（natural/horizon 或 null）。
-allocation 对阻塞组为 null；接入组含 path、hops（link/direction/cores/physical_cores）、
+status（仅 accepted）、release_time、release_reason（natural/horizon）。
+source/destination/direction 描述端到端业务；回放传播方向必须读取 hops.direction，
+不能由端到端节点编号推断。allocation 含完整 path 和选中链路的 hops（link/direction/cores/physical_cores）、
 channel_index、frequency_hz 和 wavelength_nm。cores 为零起始仿真编号，physical_cores
 为物理芯号，不包含硬件端口。同组同方向三芯占用一致，两个方向可复用同一波长。
 负载单位为三芯业务组 Erlang，到达率按组/仿真时间计，功率为每芯每信道输入功率。
@@ -51,7 +54,8 @@ class TrafficRecorder:
         if not sim.allocator.bind_three:
             raise ValueError('Business trace requires a three-core experiment allocator')
         self.sim = sim
-        self.links = sorted((int(a), int(b)) for a, b in sim.graph.to_directed().edges)
+        a, b = sim.observed_link
+        self.links = [(a, b), (b, a)]
         self.link_index = {tuple(link): i for i, link in enumerate(self.links)}
         self.occupancy = [
             [[-1 if sim.m_resourceMap[a, b, c, w] == 1 else -2
@@ -60,6 +64,10 @@ class TrafficRecorder:
         self.config = dict(
             algorithm='first-fit' if sim.algorithm == 'FF' else sim.algorithm.lower(),
             seed=int(seed), duration=float(sim.Ts), warmup=float(warmup),
+            observed_link=list(sim.observed_link), allocation_scope='full_network',
+            network_node_count=len(sim.graph), network_edge_count=sim.graph.number_of_edges(),
+            network_length_scaling=deepcopy(sim.graph.graph['length_scaling']),
+            network_edges_m=[(int(a), int(b), float(sim.a_m[a, b])) for a, b in sim.graph.edges],
             mean_holding_time=float(sim.m_rou1), arrival_rate=float(sim.lambda1),
             offered_load_erlang=float(sim.lambda1 * sim.m_rou1),
             power_dbm=float(10 * math.log10(sim.launch_power / 1e-3)),
@@ -67,7 +75,7 @@ class TrafficRecorder:
             allocation_mode='three_core_bound', traffic_unit='three_core_business_group',
             load_unit='Erlang of three-core business groups',
             arrival_rate_unit='three-core groups per simulation unit',
-            direction_definition='forward: source < destination; backward: source > destination; independent resources',
+            direction_definition='business direction uses end-to-end source/destination; each hop direction uses its link endpoints (forward u<v, backward u>v); replay must use hop direction',
             time_unit='simulation_unit', direction_mode='bidirectional',
             directed_links=[list(link) for link in self.links],
             link_lengths_m=[float(sim.a_m[a, b]) for a, b in self.links],
@@ -86,13 +94,19 @@ class TrafficRecorder:
         self.business_groups = []
 
     def record(self, event, *, blocked=False):
-        """记录每组到达及其真实资源变化；阻塞组无分配，也不生成状态变化。
+        """记录经过观测链路的已接入组及其真实资源变化；阻塞和其他链路业务不写入回放。
 
         业务组和 states 的 group_id 对应；离去沿用到达时的三芯成员。
         每次事件核对回放与真实资源/功率，避免在导出阶段凭空复制三芯占用。
         """
         bid = int(event.m_id)
         arrival = bool(event.m_eventType['Arrival'])
+        # 仅导出真实经过观测链路的已接入业务；全网到达/阻塞计数保留在 metrics。
+        if arrival:
+            if blocked or not any((a, b) in self.link_index for a, b in zip(event.m_workPath, event.m_workPath[1:])):
+                return
+        elif bid not in self.active:
+            return
         if arrival:
             service = dict(group_id=bid, source=int(event.m_sourceNode), destination=int(event.m_destNode),
                 direction='forward' if event.m_sourceNode < event.m_destNode else 'backward',
@@ -108,7 +122,8 @@ class TrafficRecorder:
                     hops=[dict(link=[a, b], direction='forward' if a < b else 'backward',
                                cores=[int(c) for c in cores],
                                physical_cores=[CORE_TO_PHYSICAL[c] for c in cores])
-                          for a, b, cores in zip(path, path[1:], event.m_ocuppiedcore)],
+                          for a, b, cores in zip(path, path[1:], event.m_ocuppiedcore)
+                          if (a, b) in self.link_index],
                     channel_index=int(event.m_ocuppiedwave - self.sim.quantum_wave_num),
                     frequency_hz=frequency, wavelength_nm=299792458 / frequency * 1e9)
                 self.active[bid] = service
@@ -235,13 +250,18 @@ def export_excel(path, summary, runs, samples, metadata, save_samples=False, *, 
         sheet.sheet_view.showGridLines = False
         headers = list(records[0])
         if name == 'Summary':
-            first = ['scenario', 'offered_load_erlang', 'algorithm', 'skr_mean', 'skr_mean_sd',
+            first = ['scenario', 'offered_load_erlang', 'algorithm',
+                     'osnr_db_mean', 'osnr_db_mean_sd',
+                     'synergy_vs_FF', 'synergy_vs_FF_sd',
+                     'skr_mean', 'skr_mean_sd',
                      'gain_vs_FF', 'gain_vs_SCWA', 'blocking_rate', 'carried_load_erlang',
-                     'fallback_rate', 'zero_skr_fraction_mean', 'seed_count']
+                     'zero_skr_fraction_mean', 'seed_count']
             headers = [key for key in first if key in headers] + [key for key in headers if key not in first]
         sheet.append(headers)
         for record in records:
-            sheet.append([record.get(key) for key in headers])
+            sheet.append([json.dumps(record.get(key), ensure_ascii=False)
+                          if isinstance(record.get(key), (list, tuple, dict)) else record.get(key)
+                          for key in headers])
         sheet.freeze_panes = 'D2' if name != 'Config' else 'A2'
         for cell in sheet[1]:
             cell.font = Font(name='Arial', bold=True, color='FFFFFF', size=10)
@@ -258,7 +278,7 @@ def export_excel(path, summary, runs, samples, metadata, save_samples=False, *, 
                     cell.font = Font(name='Arial', size=10)
                     cell.alignment = Alignment(vertical='center', wrap_text=name == 'Config')
                     if isinstance(cell.value, float):
-                        is_rate = any(x in key for x in ('gain_vs_', 'blocking_rate', 'fallback_rate',
+                        is_rate = any(x in key for x in ('gain_vs_', 'blocking_rate',
                                                        'zero_skr_fraction', 'channel_utilization'))
                         cell.number_format = ('0.00%' if is_rate else
                                               '0.000E+00' if '_w_' in key or key.startswith('noise_counts') else
@@ -273,10 +293,10 @@ def export_excel(path, summary, runs, samples, metadata, save_samples=False, *, 
 
 
 def plot_scan(output, summary):
-    """按场景画 SKR、阻塞率、承载量、噪声和增益，返回生成的文件名列表。
+    """按场景画 OSNR、协同度、SKR、阻塞率、承载量、噪声和增益，返回生成的文件名列表。
 
     只使用 summary 的均值和标准差，不从回放重算。40% 增益虚线是预设研究
-    参考目标，不代表实测达到，也不是算法约束；诊断图区分回退率与零 SKR 比例。
+    参考目标，不代表实测达到，也不是算法约束；诊断图展示零 SKR 比例。
     """
     import matplotlib
     matplotlib.use('Agg')
@@ -284,16 +304,19 @@ def plot_scan(output, summary):
     from matplotlib.ticker import PercentFormatter
 
     colors = {'FF': '#D55E00', 'SCWA': '#0072B2', 'GREEDY_MIN_NOISE': '#009E73',
-              'CQLI': '#E69F00'}
+              'CQLI': '#E69F00', 'CCA': '#CC79A7'}
     frame = pd.DataFrame(summary)
     artifacts = []
     for index, (scenario, group) in enumerate(frame.groupby('scenario', sort=False), 1):
-        fig, axes = plt.subplots(2, 3, figsize=(15, 8), layout='constrained')
-        specs = [('skr_mean', 'Usable SKR (kbit/s)', .001),
+        fig, axes = plt.subplots(3, 3, figsize=(16, 12), layout='constrained')
+        specs = [('osnr_db_mean', 'Reference link OSNR (dB)', 1),
+                 ('synergy_vs_FF', 'Reference synergy vs first-fit', 1),
+                 ('skr_mean', 'Mean link SKR per channel (kbit/s)', .001),
                  ('blocking_rate', 'Blocking probability', 1),
                  ('carried_load_erlang', 'Carried traffic (Erlang)', 1),
                  ('fwm_w_mean', 'FWM at quantum receivers (pW)', 1e12),
-                 ('raman_w_mean', 'Raman at quantum receivers (pW)', 1e12)]
+                 ('raman_w_mean', 'Raman at quantum receivers (pW)', 1e12),
+                 ('zero_skr_fraction_mean', 'Zero-SKR fraction', 1)]
         for ax, (metric, label, factor) in zip(axes.flat, specs):
             for algorithm, data in group.groupby('algorithm', sort=False):
                 data = data.sort_values('offered_load_erlang')
@@ -304,9 +327,11 @@ def plot_scan(output, summary):
                 if np.isfinite(sd).any():
                     ax.fill_between(x, y - sd, y + sd, color=color, alpha=.12)
             ax.set_ylabel(label)
-        axes[0, 1].yaxis.set_major_formatter(PercentFormatter(1))
+        axes[1, 0].yaxis.set_major_formatter(PercentFormatter(1))
+        axes[2, 1].yaxis.set_major_formatter(PercentFormatter(1))
+        axes[0, 1].axhline(0, color="#AAAAAA", lw=.8)
         axes[0, 0].legend(fontsize=8)
-        gain = axes[1, 2]
+        gain = axes[2, 2]
         new = group[group.algorithm == 'GREEDY_MIN_NOISE'].sort_values('offered_load_erlang')
         for baseline, marker in [('FF', 'o'), ('SCWA', 's')]:
             if len(new) and new['gain_vs_' + baseline].notna().any():
@@ -351,23 +376,75 @@ def plot_scan(output, summary):
             fig.savefig(path, dpi=180)
             artifacts.append(path.name)
         plt.close(fig)
-    # 回退比例单独绘制，不能当作物理 FWM 功率。
+    # 直接噪声评分没有“回退”等级，只保留量子信道失效比例诊断。
     new = frame[frame.algorithm == 'GREEDY_MIN_NOISE']
     if len(new):
-        fig, axes = plt.subplots(1, 2, figsize=(10, 4), layout='constrained')
+        fig, ax = plt.subplots(figsize=(6, 4), layout='constrained')
         for scenario, group in new.groupby('scenario', sort=False):
             group = group.sort_values('offered_load_erlang')
-            for ax, key in zip(axes, ('fallback_rate', 'zero_skr_fraction_mean')):
-                ax.plot(group.offered_load_erlang, group[key], marker='o', label=scenario)
-        for ax, label in zip(axes, ('FWM fallback / admitted arrivals', 'Zero-SKR channel samples / all channel samples')):
-            ax.set(xlabel='Offered traffic (Erlang)', ylabel=label)
-            ax.yaxis.set_major_formatter(PercentFormatter(1))
-            ax.grid(alpha=.2)
-            ax.legend(fontsize=8)
-        axes[0].set_ylim(0, 1)
-        axes[1].set_ylim(0, max(.01, float(new.zero_skr_fraction_mean.max()) * 1.1))
+            ax.plot(group.offered_load_erlang, group.zero_skr_fraction_mean, marker='o', label=scenario)
+        ax.set(xlabel='Offered traffic (Erlang)', ylabel='Zero-SKR channel samples / all channel samples')
+        ax.yaxis.set_major_formatter(PercentFormatter(1))
+        ax.grid(alpha=.2)
+        ax.legend(fontsize=8)
+        ax.set_ylim(0, max(.01, float(new.zero_skr_fraction_mean.max()) * 1.1))
         for suffix in ('png', 'svg'):
             path = output / f'traffic_diagnostics.{suffix}'
+            fig.savefig(path, dpi=180)
+            artifacts.append(path.name)
+        plt.close(fig)
+    artifacts.extend(plot_power_comparison(output, summary))
+    return artifacts
+
+
+def plot_power_comparison(output, summary):
+    """同长度、负载有多个功率点时导出功率对照 PNG/SVG，仅使用本批汇总。
+
+    OSNR 使用参考串扰加固定噪声底；另展示串扰功率。阴影为种子均值的样本标准差，
+    SKR 相对增益是跨种子均值之比，没有误差带。不同长度/负载不连成一条曲线。
+    长度为 None 表示使用当前拓扑边长。缺失指标保留断点，不作零值或连线填补。
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import PercentFormatter
+
+    frame = pd.DataFrame(summary)
+    artifacts = []
+    colors = {'FF': '#D55E00', 'SCWA': '#0072B2', 'GREEDY_MIN_NOISE': '#009E73',
+              'CQLI': '#E69F00', 'CCA': '#CC79A7'}
+    specs = [('osnr_db_mean', 'Reference link OSNR (dB)', 1),
+             ('classical_xt_w_mean', 'Mean link XT power (W)', 1),
+             ('skr_mean', 'Mean link SKR per channel (kbit/s)', .001),
+             ('gain_vs_FF', 'Relative SKR gain vs FF', 1),
+             ('synergy_vs_FF', 'Reference synergy vs FF', 1),
+             ('blocking_rate', 'Blocking probability', 1)]
+    for index, ((length, load), group) in enumerate(
+            frame.groupby(['length_km', 'offered_load_erlang'], dropna=False, sort=False), 1):
+        if group.power_dbm.nunique() < 2:
+            continue
+        fig, axes = plt.subplots(2, 3, figsize=(15, 8), layout='constrained')
+        for ax, (metric, label, factor) in zip(axes.flat, specs):
+            for algorithm, data in group.groupby('algorithm', sort=False):
+                data = data.sort_values('power_dbm')
+                x = data.power_dbm.to_numpy(dtype=float)
+                y = data[metric].to_numpy(dtype=float) * factor
+                ax.plot(x, y, marker='o', ms=4, color=colors[algorithm], label=algorithm)
+                if metric + '_sd' in data:
+                    sd = data[metric + '_sd'].to_numpy(dtype=float) * factor
+                    ax.fill_between(x, y-sd, y+sd, color=colors[algorithm], alpha=.10)
+            ax.set(xlabel='Launch power per core/channel (dBm)', ylabel=label)
+            ax.grid(alpha=.2)
+            ax.spines[['top', 'right']].set_visible(False)
+        axes[0, 0].legend(fontsize=8)
+        axes[1, 0].yaxis.set_major_formatter(PercentFormatter(1))
+        axes[1, 2].yaxis.set_major_formatter(PercentFormatter(1))
+        axes[1, 0].axhline(0, color='#999999', lw=.8)
+        axes[1, 1].axhline(0, color='#999999', lw=.8)
+        distance = 'Topology edge lengths' if pd.isna(length) else f'{length:g} km per edge'
+        fig.suptitle(f'{distance} | {load:g} Erlang | {int(group.seed_count.iloc[0])} seeds | shaded: seed SD')
+        for suffix in ('png', 'svg'):
+            path = output / f'power_comparison_{index}.{suffix}'
             fig.savefig(path, dpi=180)
             artifacts.append(path.name)
         plt.close(fig)
@@ -375,9 +452,10 @@ def plot_scan(output, summary):
 
 
 def export_business_summary(output, runs, metadata, summary):
-    """用本批统计生成一份 Excel 和六张 PNG，返回相对输出目录的文件名。
+    """用本批统计生成 Excel 和 OSNR/协同度/SKR/阻塞率的 PNG、SVG，返回相对输出目录的文件名。
 
-    每组输出 SKR/阻塞率趋势，另有两组并排的总览图。Excel 使用可编辑的
+    每组输出 OSNR/协同度/SKR/阻塞率趋势，另有两组并排的总览图。
+    Excel 中 OSNR 图排在最前，协同度采用参考非负定义。Excel 使用可编辑的
     数值横轴图，标准差列保留在表里；PNG 显示误差棒。重合曲线不人为平移。
     阻塞率图不画阈值线。每张 SKR 图只标注 greedy 相对 FF 的最大正提升：
     (greedy 的种子均值 / FF 的种子均值 - 1)。FF 非正或任一值缺失时不计算，
@@ -408,7 +486,9 @@ def export_business_summary(output, runs, metadata, summary):
     note = (f"10 km bidirectional | slots={metadata['slots']}, warmup={metadata['warmup']} | "
             f"{len(metadata['seeds'])} seed(s); " +
             ('error bars: across-seed SD' if len(metadata['seeds']) > 1 else 'single-seed trend'))
-    metrics = [('skr_kbit_s', 'skr_sd_kbit_s', 'Mean total SKR (kbit/s)', 'skr_trends.png', 'total_skr.png'),
+    metrics = [('osnr_db_mean', 'osnr_db_mean_sd', 'Reference link OSNR (dB)', 'osnr_trends.png', 'classical_osnr.png'),
+               ('synergy_vs_FF', 'synergy_vs_FF_sd', 'Reference synergy vs first-fit', 'synergy_trends.png', 'synergy.png'),
+               ('skr_kbit_s', 'skr_sd_kbit_s', 'Mean link SKR per channel (kbit/s)', 'skr_trends.png', 'total_skr.png'),
                ('blocking_rate', 'blocking_rate_sd', 'Classical blocking probability',
                 'blocking_trends.png', 'blocking_rate.png')]
     for metric_index, (metric, sd_key, y_label, overview, filename) in enumerate(metrics):
@@ -416,7 +496,11 @@ def export_business_summary(output, runs, metadata, summary):
         upper = max((r[prefix + '_' + metric] + (r[prefix + '_' + sd_key] or 0)
                      for rows in summary.values() for r in rows for prefix, *_ in series
                      if r[prefix + '_' + metric] is not None), default=0)
-        upper = min(1, max(.01, upper) * 1.15) if blocking else max(1, upper * 1.08)
+        lower = min((r[prefix + '_' + metric] - (r[prefix + '_' + sd_key] or 0)
+                     for rows in summary.values() for r in rows for prefix, *_ in series
+                     if r[prefix + '_' + metric] is not None), default=0)
+        lower = min(0, lower * 1.08)
+        upper = min(1, max(.01, upper) * 1.15) if blocking else max(.01, upper * 1.08)
         fig, axes = plt.subplots(1, 2, figsize=(12, 4.8), layout='constrained')
         for ax, (group, sheet_name, x_key, x_label, title) in zip(axes, specs):
             sheet = workbook[sheet_name]
@@ -425,7 +509,7 @@ def export_business_summary(output, runs, metadata, summary):
             chart.title, chart.x_axis.title, chart.y_axis.title = title, x_label, y_label
             chart.scatterStyle = 'lineMarker'
             chart.width, chart.height = 25, 13
-            chart.y_axis.scaling.min, chart.y_axis.scaling.max = 0, upper
+            chart.y_axis.scaling.min, chart.y_axis.scaling.max = lower, upper
             x_values = Reference(sheet, min_col=headers.index(x_key) + 1, min_row=2, max_row=sheet.max_row)
             single, single_ax = plt.subplots(figsize=(7, 4.8), layout='constrained')
             for prefix, label, color, marker, style in series:
@@ -460,7 +544,7 @@ def export_business_summary(output, runs, metadata, summary):
                            for r in summary[group]):
                         target.text(.03, .95, 'Algorithm curves overlap', transform=target.transAxes,
                                     va='top', fontsize=9, color='#555555')
-            else:
+            elif metric == 'skr_kbit_s':
                 comparable = [(index, row) for index, row in enumerate(summary[group])
                               if row['ff_skr_kbit_s'] is not None and row['ff_skr_kbit_s'] > 0
                               and row['greedy_skr_kbit_s'] is not None
@@ -496,17 +580,23 @@ def export_business_summary(output, runs, metadata, summary):
                     chart.series.append(annotation)
             sheet.add_chart(chart, f'A{sheet.max_row + 4 + 28 * metric_index}')
             for target in (ax, single_ax):
-                target.set(xlabel=x_label, ylabel=y_label, title=title, ylim=(0, upper))
+                target.set(xlabel=x_label, ylabel=y_label, title=title, ylim=(lower, upper))
                 target.grid(alpha=.2)
                 target.spines[['top', 'right']].set_visible(False)
                 target.legend(fontsize=9, loc='lower right' if blocking else 'best')
             single.suptitle(note, fontsize=8)
             figure_path = f'{group}/{filename}'
             single.savefig(output / figure_path, dpi=180)
+            vector_path = str(Path(figure_path).with_suffix('.svg'))
+            single.savefig(output / vector_path)
+            artifacts.append(vector_path)
             plt.close(single)
             artifacts.append(figure_path)
         fig.suptitle(note, fontsize=10)
         fig.savefig(output / overview, dpi=180)
+        vector_path = str(Path(overview).with_suffix('.svg'))
+        fig.savefig(output / vector_path)
+        artifacts.append(vector_path)
         plt.close(fig)
         artifacts.append(overview)
     workbook.save(path)

@@ -15,5 +15,6 @@ Thumbs.db
 
 # 临时运行核查；正式 results/ 数据应保留
 .release_check/
+/.tmp*/
 *.tmp
 *.log
