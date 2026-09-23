@@ -34,6 +34,7 @@
 - `traffic_scan.py`：由 `main.py --scan-load/--scan-power/--scan-distance/--scan-all` 或 `--export-business` 调用，负责负载/功率/距离实验编排、配对业务校验、窗口内采样、跨种子统计和统一源码哈希清单；通过实例的 `iter_slots()` 观察事件，不另写事件循环，不反向导入 `main.py`。
 - `traffic_export.py`：记录资源状态变化、序列化回放与扫描 JSON、生成 Excel 和图表；仅接收实例状态或已统计的结果，不生成业务、不做分配决策、不编排扫描，不反向导入 `main.py` 或 `traffic_scan.py`。
 - `algorithm.py`：全部资源分配算法实现。
+- 扫描与业务图仅标注 GREEDY_MIN_NOISE 相对 CCA 的最大 SKR 绝对百分比差（|SKR/CCA-1|，CCA为零时跳过）及最大 OSNR 绝对差对应的带符号 dB 差。Excel 使用普通黑白单元格，只含必要条件、算法、SKR/OSNR/阻塞率/协同度及四项各自相对FF的比值；OSNR比值使用线性值，基准为零或缺失时留空，不附加配置/样本页或图表，完整数据保留在JSON。
 - `topology.py`、`core_layout.py`、`topologies/`：拓扑、路由与纤芯邻接数据。
 
 正式实验应复用上述入口。不要为某次探索、消融或固定结论新增长期保留的 `analyze_*`、`benchmark_*`、`validate_*`、`report_*` 阶段脚本；可复用且正式仿真需要的能力应合入对应模块。

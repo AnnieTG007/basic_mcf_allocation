@@ -297,7 +297,7 @@ def run_load_scan(args, build_simulation, base):
     """运行场景×负载×种子×算法的组合，通过相同业务序列公平比较算法。
     
     ALL 运行五种算法；单独选择算法时自动补跑新 FF 基准。返回含 config/summary/runs/samples 的字典，JSON 始终
-    保存逐时隙样本，--save-samples 只决定是否附加 Excel Samples 表。
+    保存逐时隙样本；--save-samples 仅兼容旧命令，Excel 始终只输出简表。
     参数、物理配置及本次依赖版本随结果保存；输出位置由 args.output_dir 决定。
     """
     loads, seeds, warmup, scenarios = scan_settings(args)
@@ -400,7 +400,7 @@ def summarize_business(runs):
     """分别汇总负载组和功率组，有效种子值等权平均；趋势表 SKR 为 kbit/s，runs 为 bit/s。
 
     gain_vs_FF/CCA 为 greedy 均值除以对应基准均值再减一，无量纲，保留零或负值。
-    基准缺失或非正、greedy 缺失时留空；图表另行筛选最大正提升。
+    基准缺失或非正、greedy 缺失时留空；图表独立标注提出算法与CCA的最大SKR绝对百分比差和OSNR差。
     """
     frame = pd.DataFrame(runs)
     result = {'load_scan': [], 'power_scan': []}
@@ -485,7 +485,7 @@ def run_business_export(args, build_simulation, base):
                     classical_channels=args.classical_channels, quantum_channels=1,
                     fixed_power_dbm=args.fixed_power, seeds=seeds, slots=args.slots, warmup=warmup,
                     holding_time=args.holding_time, topology=args.topology, length_km=args.link_length_km, algorithms=algorithms,
-                    skr_units='Sweep sheets/figures: kbit/s; Runs and trace JSON: bit/s. Not accumulated secret bits.',
+                    skr_units='Sweep sheets/figures: kbit/s; runs and trace JSON: bit/s. Not accumulated secret bits.',
                     uncertainty='Equal-weight seed means; sample SD across seeds, blank for one seed; not a confidence interval',
                     gain_definition='Ratio of seed mean SKR minus one; blank if baseline absent or zero',
                     blank_definition='Unavailable or undefined, not zero',

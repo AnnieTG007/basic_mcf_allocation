@@ -596,7 +596,7 @@ def main(argv=None):
     parser.add_argument("--scan-scenarios", nargs="+", default=None, metavar="KM:DBM",
                         help="全网边长与每信道功率配对，例如 1:13.5 10:10.5；不指定则使用单次参数")
     parser.add_argument("--output-dir", type=Path, default=None, help="扫描输出目录，默认 results/traffic_scan_时间戳")
-    parser.add_argument("--save-samples", action="store_true", help="Excel 中附加预热后的逐时隙样本（JSON始终保留）")
+    parser.add_argument("--save-samples", action="store_true", help="兼容旧命令；样本始终保留在JSON，Excel仅输出简表")
     parser.add_argument("--export-business", action="store_true", help="导出负载/功率两组业务回放 JSON，比较 FF、CCA 与 GREEDY_MIN_NOISE")
     parser.add_argument("--powers", type=float, nargs='+', help="功率扫描点，默认 7 8 9 10 10.5 dBm")
     parser.add_argument("--fixed-load", type=float, default=None, help="功率/距离扫描固定负载/Erlang（默认10）；仅业务导出按三芯组计数")

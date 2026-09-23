@@ -24,9 +24,10 @@ occupancy 的维度为 [有向链路, 仿真芯, 经典信道]，链路顺序见
 不是 ITU 编号，也不是包含量子频率的仿真内部索引。channel_spacing_hz 只是
 基础网格间隔；跨量子频段及跳过 C33 均形成缺口，应读取实际 classical_frequencies_hz。
 
-扫描工作簿含 Summary/Runs/Config，可选 Samples；业务工作簿含
-LoadSweep/PowerSweep/Runs/Config。JSON/Runs 的 SKR 为 bit/s，趋势图和业务
-趋势表为 kbit/s；它们表示密钥生成速率而非累计密钥比特。误差范围是种子
+扫描工作簿仅含 Summary；业务工作簿仅含 LoadSweep/PowerSweep。表格为普通黑白
+单元格，仅含条件、算法、SKR/OSNR/阻塞率/协同度及四项各自相对FF的比值。
+完整配置、逐种子数据与样本保留在JSON。JSON 的 SKR 为 bit/s，趋势图和表格
+为 kbit/s；它们表示密钥生成速率而非累计密钥比特。误差范围是种子
 均值间的样本标准差，单种子时不显示；空白表示未定义而非零。
 """
 from copy import deepcopy
@@ -217,83 +218,88 @@ def write_trace(path, data):
     return sha256(path.read_bytes()).hexdigest()
 
 
-def configuration_records(metadata):
-    """将配置展开为 parameter/value 两列；嵌套结构存为 JSON 文本供 Excel 阅读。"""
-    records = []
-    for key, value in metadata.items():
-        items = [(key, value)] if key != 'physical_configurations' else [
-            (f'{key}.{label}', config) for label, config in value.items()]
-        for label, config in items:
-            records.append(dict(parameter=label, value=json.dumps(config, ensure_ascii=False)
-                           if isinstance(config, (dict, list, tuple)) else config))
-    return records
+def export_excel(path, tables):
+    """写普通黑白汇总表：条件、算法、四项指标及四项相对 first-fit 的比值。
 
-
-def export_excel(path, summary, runs, samples, metadata, save_samples=False, *, summary_tables=None):
-    """将已完成统计写为 xlsx，无需安装 Excel，不重新计算科学指标。
-
-    summary_tables 可覆盖默认 Summary 表，Runs/Config 始终写入；仅当
-    save_samples 为真时增加 Samples。记录数超过 Excel 行数限制时报错。
-    百分比在底层仍存 0..1 数值，None 显示为空白。
+    tables 为 (表名, 已汇总记录, 条件字段) 列表；条件字段是 (键, 显示名) 序列，
+    同表内用全部条件配对 FF。记录使用普通扫描的指标键，SKR 输入 bit/s、输出
+    kbit/s；OSNR 数值列为 dB，比值使用跨种子平均线性 OSNR，不能相除 dB。
+    比值为算法均值/FF均值，不减1；分子/基准缺失或基准为零时留空。
+    FF 协同度恒为零，因此协同度比值列留空。只写汇总，不写配置、样本或图表。
     """
     from openpyxl import Workbook
-    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.styles import Alignment
     from openpyxl.utils import get_column_letter
-    from openpyxl.worksheet.table import Table, TableStyleInfo
 
     workbook = Workbook()
     workbook.remove(workbook.active)
-    tables = (summary_tables if summary_tables is not None else [('Summary', summary)]) + [
-        ('Runs', runs), ('Config', configuration_records(metadata))]
-    if save_samples:
-        tables.append(('Samples', samples))
-    for name, records in tables:
+    metrics = [('skr_mean', 'SKR (kbit/s)', .001, '0.000'),
+               ('osnr_db_mean', 'OSNR (dB)', 1, '0.000'),
+               ('blocking_rate', 'Blocking rate', 1, '0.00%'),
+               ('synergy_vs_FF', 'Synergy', 1, '0.000000')]
+    ratio_keys = ('skr_mean', 'osnr_linear_mean', 'blocking_rate', 'synergy_vs_FF')
+    for name, records, conditions in tables:
         if len(records) > 1_048_575:
-            raise ValueError(f'{name} exceeds Excel row limit; omit --save-samples (JSON retains samples)')
+            raise ValueError(f'{name} exceeds Excel row limit')
         sheet = workbook.create_sheet(name)
-        sheet.sheet_view.showGridLines = False
-        headers = list(records[0])
-        if name == 'Summary':
-            first = ['scenario', 'offered_load_erlang', 'algorithm',
-                     'osnr_db_mean', 'osnr_db_mean_sd',
-                     'synergy_vs_FF', 'synergy_vs_FF_sd',
-                     'skr_mean', 'skr_mean_sd',
-                     'gain_vs_FF', 'gain_vs_SCWA', 'blocking_rate', 'carried_load_erlang',
-                     'zero_skr_fraction_mean', 'seed_count']
-            headers = [key for key in first if key in headers] + [key for key in headers if key not in first]
+        headers = [label for _, label in conditions] + ['Algorithm']
+        headers += [label for _, label, _, _ in metrics]
+        headers += ['SKR / FF', 'OSNR / FF (linear)', 'Blocking / FF', 'Synergy / FF']
         sheet.append(headers)
-        for record in records:
-            sheet.append([json.dumps(record.get(key), ensure_ascii=False)
-                          if isinstance(record.get(key), (list, tuple, dict)) else record.get(key)
-                          for key in headers])
-        sheet.freeze_panes = 'D2' if name != 'Config' else 'A2'
-        for cell in sheet[1]:
-            cell.font = Font(name='Arial', bold=True, color='FFFFFF', size=10)
-            cell.fill = PatternFill('solid', fgColor='254B72')
-            cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
-        sheet.row_dimensions[1].height = 42
-        for column, key in enumerate(headers, 1):
-            width = 28 if key == 'algorithm' else min(30, max(15, len(key) + 2))
-            if name == 'Config':
-                width = 32 if column == 1 else 115
-            sheet.column_dimensions[get_column_letter(column)].width = width
+        baseline = {tuple(row[key] for key, _ in conditions): row for row in records
+                    if row['algorithm'] in ('FF', 'first-fit')}
+        for row in records:
+            key = tuple(row[key] for key, _ in conditions)
+            ref = baseline.get(key, {})
+            values = list(key) + [row['algorithm']]
+            values += [row[metric] * factor if row[metric] is not None else None
+                       for metric, _, factor, _ in metrics]
+            values += [row[metric] / ref[metric]
+                       if row.get(metric) is not None and ref.get(metric) not in (None, 0)
+                       else None for metric in ratio_keys]
+            sheet.append(values)
+        formats = ['General'] * len(conditions) + ['General']
+        formats += [fmt for _, _, _, fmt in metrics] + ['0.000000'] * 4
+        for column, (label, number_format) in enumerate(zip(headers, formats), 1):
+            sheet.column_dimensions[get_column_letter(column)].width = 26 if label == 'Algorithm' else 20
+            sheet.cell(1, column).alignment = Alignment(wrap_text=True, vertical='center')
             for cells in sheet.iter_cols(min_col=column, max_col=column, min_row=2):
                 for cell in cells:
-                    cell.font = Font(name='Arial', size=10)
-                    cell.alignment = Alignment(vertical='center', wrap_text=name == 'Config')
-                    if isinstance(cell.value, float):
-                        is_rate = any(x in key for x in ('gain_vs_', 'blocking_rate',
-                                                       'zero_skr_fraction', 'channel_utilization'))
-                        cell.number_format = ('0.00%' if is_rate else
-                                              '0.000E+00' if '_w_' in key or key.startswith('noise_counts') else
-                                              '#,##0.000')
-        if name == 'Config':
-            for row in sheet.iter_rows(min_row=2):
-                sheet.row_dimensions[row[0].row].height = max(22, 15 * math.ceil(len(str(row[1].value)) / 105))
-        table = Table(displayName=name + 'Table', ref=sheet.dimensions)
-        table.tableStyleInfo = TableStyleInfo(name='TableStyleMedium2', showRowStripes=True)
-        sheet.add_table(table)
+                    cell.number_format = number_format
+        sheet.row_dimensions[1].height = 30
     workbook.save(path)
+
+
+def annotate_max_gap(ax, points, metric, unit):
+    """points 为 (横轴值, 提出算法值, CCA值)，数值已转换为图中单位。
+
+    只比较同一横轴、同一场景的有限均值。SKR 选择 |提出算法/CCA-1| 最大点，
+    以无符号百分比标注，CCA<=0 时比例未定义，跳过。OSNR 选 dB 绝对差最大点，
+    标签保留提出算法减CCA的正负号。同分选较小横轴，全相等标0，缺配对则不标。
+    """
+    pairs = [(x, proposed, cca) for x, proposed, cca in points
+             if proposed is not None and cca is not None
+             and np.isfinite(proposed) and np.isfinite(cca)]
+    if not pairs:
+        return
+    if metric == 'SKR':
+        pairs = [p for p in pairs if p[2] > 0]
+        if not pairs:
+            return
+        x, proposed, cca = max(pairs, key=lambda p: (abs(p[1] / p[2] - 1), -p[0]))
+        label = f'Max SKR difference vs CCA: {abs(proposed / cca - 1):.2%}'
+    else:
+        x, proposed, cca = max(pairs, key=lambda p: (abs(p[1] - p[2]), -p[0]))
+        label = f'Max {metric} gap vs CCA: {proposed - cca:+.3g} {unit}'
+    difference = proposed - cca
+    if difference != 0:
+        ax.annotate('', xy=(x, proposed), xytext=(x, cca),
+                    arrowprops=dict(arrowstyle='<->', color='#555555', lw=1.2))
+    ax.annotate(label,
+                xy=(x, (proposed + cca) / 2), xytext=(.03, .97),
+                textcoords='axes fraction', ha='left', va='top', fontsize=9,
+                arrowprops=dict(arrowstyle='-', color='#555555', lw=.8),
+                bbox=dict(facecolor='white', edgecolor='none', alpha=.85, pad=2))
 
 
 def plot_scan(output, summary, scan_axis='load'):
@@ -302,8 +308,9 @@ def plot_scan(output, summary, scan_axis='load'):
     只使用 summary 的均值和跨种子样本标准差，不从回放重算。
     横轴由 scan_axis 选择负载/Erlang、每芯每信道功率/dBm 或统一边长/km。SKR 从 bit/s 转为 kbit/s，阻塞率显示为百分比。
     标准差有有限值时绘制阴影；调用方将单种子标准差设为空，缺失值保留断点。
-    SKR 面板标注 greedy 相对 FF 的最大正提升（跨种子均值之比减1）；
-    同分选较小横轴值，FF 非正或缺失时跳过，无正提升不标注。返回 SVG 文件名列表。
+    功率/距离扫描由调用方保证每个横轴值只对应一个场景。
+    仅 SKR、OSNR 面板标注 GREEDY_MIN_NOISE 与 CCA 的最大差：SKR 为绝对
+    百分比差，OSNR 为带符号 dB 差；同分选较小横轴，缺配对不标注。返回 SVG 文件名列表。
     """
     import matplotlib
     matplotlib.use('Agg')
@@ -341,22 +348,13 @@ def plot_scan(output, summary, scan_axis='load'):
                     ax.fill_between(x, y - sd, y + sd, color=color, alpha=.12)
             ax.set_ylabel(label)
         greedy = group[group.algorithm == 'GREEDY_MIN_NOISE'].set_index(x_key)
-        baseline = group[group.algorithm == 'FF'].set_index(x_key)
-        paired = greedy[['skr_mean']].join(baseline[['skr_mean']], lsuffix='_greedy', rsuffix='_ff', how='inner')
-        paired = paired[(paired.skr_mean_ff > 0) & (paired.skr_mean_greedy > paired.skr_mean_ff)]
-        if len(paired):
-            gains = (paired.skr_mean_greedy / paired.skr_mean_ff - 1).sort_index()
-            load = gains.idxmax()
-            low, high = paired.loc[load, ['skr_mean_ff', 'skr_mean_greedy']] * .001
-            ax = axes[1, 0]
-            ax.annotate('', xy=(load, high), xytext=(load, low),
-                        arrowprops=dict(arrowstyle='<->', color='#555555', lw=1.2))
-            right_half = load > (group[x_key].min() + group[x_key].max()) / 2
-            ax.annotate(f'Max SKR gain vs FF: +{gains.loc[load]:.2%}',
-                        xy=(load, (low + high) / 2),
-                        xytext=(-12 if right_half else 12, 12), textcoords='offset points',
-                        ha='right' if right_half else 'left', va='bottom', fontsize=9,
-                        bbox=dict(facecolor='white', edgecolor='none', alpha=.85, pad=2))
+        cca = group[group.algorithm == 'CCA'].set_index(x_key)
+        for ax, metric, factor, label, unit in (
+                (axes[1, 0], 'skr_mean', .001, 'SKR', 'kbit/s'),
+                (axes[0, 1], 'osnr_db_mean', 1, 'OSNR', 'dB')):
+            paired = greedy[[metric]].join(cca[[metric]], lsuffix='_greedy', rsuffix='_cca', how='inner').astype(float)
+            annotate_max_gap(ax, [(x, row[metric + '_greedy'] * factor, row[metric + '_cca'] * factor)
+                                 for x, row in paired.iterrows()], label, unit)
         axes[1, 1].yaxis.set_major_formatter(PercentFormatter(1))
         axes[0, 0].axhline(0, color="#AAAAAA", lw=.8)
         axes[0, 0].legend(fontsize=8)
@@ -374,20 +372,13 @@ def plot_scan(output, summary, scan_axis='load'):
 
 
 def export_business_summary(output, runs, metadata, summary):
-    """用本批统计生成 Excel 和 OSNR/协同度/SKR/阻塞率的 PNG、SVG，返回相对输出目录的文件名。
+    """生成黑白 LoadSweep/PowerSweep 简表及四指标的 PNG、SVG 趋势图。
 
-    每组输出 OSNR/协同度/SKR/阻塞率趋势，另有两组并排的总览图。
-    Excel 中 OSNR 图排在最前，协同度仅在 OSNR 和 SKR 均严格提高时取正幅值。Excel 使用可编辑的
-    数值横轴图，标准差列保留在表里；PNG 显示误差棒。重合曲线不人为平移。
-    阻塞率图不画阈值线。每张 SKR 图分别标注 greedy 相对 FF、CCA 的最大正提升：
-    (greedy 的种子均值 / 基准的种子均值 - 1)。基准非正或任一值缺失时不计算，
-    无正提升则不标；同分选横坐标较小的点。PNG/SVG 单图、总览和 Excel 共用该选择。
-    标注由本次数据自动生成，不写死负载或百分比。
+    工作簿只含条件、算法、四项指标及各自相对FF的比值，不嵌图；完整数据留在JSON。
+    图中仅标注提出算法与CCA的最大SKR绝对百分比差、OSNR差（dB），
+    单图和总览共用同一规则。
+    标准差仍显示为误差棒；缺失均值处断线，重合曲线不平移，不添加额外差异标注。
     """
-    import openpyxl
-    from openpyxl.chart import Reference, ScatterChart, Series
-    from openpyxl.chart.label import DataLabelList
-    from openpyxl.chart.legend import LegendEntry
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -403,9 +394,21 @@ def export_business_summary(output, runs, metadata, summary):
               ('greedy', 'greedy_min_noise', 'D97706', 's', '--')]
     series = [item for item in series if any(r['algorithm'] == ('first-fit' if item[0] == 'ff' else 'greedy_min_noise' if item[0] == 'greedy' else 'cca') for r in runs)]
     path = output / 'skr_summary.xlsx'
-    export_excel(path, [], runs, [], metadata,
-                 summary_tables=[(sheet, summary[group]) for group, sheet, *_ in specs])
-    workbook = openpyxl.load_workbook(path)
+    tables = []
+    algorithms = {'ff': 'first-fit', 'cca': 'CCA', 'greedy': 'GREEDY_MIN_NOISE'}
+    for group, sheet, *_ in specs:
+        records = []
+        for row in summary[group]:
+            for prefix, *_ in series:
+                record = dict(load_erlang=row['load_erlang'], power_dbm=row['power_dbm'],
+                              algorithm=algorithms[prefix],
+                              skr_mean=row[prefix + '_skr_kbit_s'] * 1000
+                              if row[prefix + '_skr_kbit_s'] is not None else None)
+                for key in ('osnr_db_mean', 'osnr_linear_mean', 'blocking_rate', 'synergy_vs_FF'):
+                    record[key] = row[prefix + '_' + key]
+                records.append(record)
+        tables.append((sheet, records, [('load_erlang', 'Load (Erlang)'), ('power_dbm', 'Power (dBm)')]))
+    export_excel(path, tables)
     artifacts = ['skr_summary.xlsx']
     note = (f"{runs[0]['observed_length_m'] / 1000:g} km bidirectional | slots={metadata['slots']}, warmup={metadata['warmup']} | "
             f"{len(metadata['seeds'])} seed(s); " +
@@ -415,7 +418,7 @@ def export_business_summary(output, runs, metadata, summary):
                ('skr_kbit_s', 'skr_sd_kbit_s', 'Mean link SKR per channel (kbit/s)', 'skr_trends.png', 'total_skr.png'),
                ('blocking_rate', 'blocking_rate_sd', 'Classical blocking probability',
                 'blocking_trends.png', 'blocking_rate.png')]
-    for metric_index, (metric, sd_key, y_label, overview, filename) in enumerate(metrics):
+    for metric, sd_key, y_label, overview, filename in metrics:
         blocking = metric == 'blocking_rate'
         upper = max((r[prefix + '_' + metric] + (r[prefix + '_' + sd_key] or 0)
                      for rows in summary.values() for r in rows for prefix, *_ in series
@@ -427,32 +430,14 @@ def export_business_summary(output, runs, metadata, summary):
         upper = min(1, max(.01, upper) * 1.15) if blocking else max(.01, upper * 1.08)
         fig, axes = plt.subplots(1, 2, figsize=(12, 4.8), layout='constrained')
         for ax, (group, sheet_name, x_key, x_label, title) in zip(axes, specs):
-            sheet = workbook[sheet_name]
-            headers = [cell.value for cell in sheet[1]]
-            chart = ScatterChart()
-            chart.title, chart.x_axis.title, chart.y_axis.title = title, x_label, y_label
-            chart.scatterStyle = 'lineMarker'
-            chart.width, chart.height = 25, 13
-            chart.y_axis.scaling.min, chart.y_axis.scaling.max = lower, upper
-            x_values = Reference(sheet, min_col=headers.index(x_key) + 1, min_row=2, max_row=sheet.max_row)
             single, single_ax = plt.subplots(figsize=(7, 4.8), layout='constrained')
             for prefix, label, color, marker, style in series:
-                points = [r for r in summary[group] if r[prefix + '_' + metric] is not None]
-                if not points:
+                points = summary[group]
+                if not any(r[prefix + '_' + metric] is not None for r in points):
                     continue
-                values = Reference(sheet, min_col=headers.index(prefix + '_' + metric) + 1,
-                                   min_row=2, max_row=sheet.max_row)
-                curve = Series(values, x_values, title=label)
-                curve.graphicalProperties.line.solidFill = color
-                curve.graphicalProperties.line.prstDash = 'dash' if style == '--' else 'solid'
-                curve.marker.symbol, curve.marker.size = ('square', 7) if marker == 's' else ('triangle', 6) if marker == '^' else ('circle', 5)
-                curve.marker.graphicalProperties.noFill = marker == 's'
-                if marker != 's':
-                    curve.marker.graphicalProperties.solidFill = color
-                curve.marker.graphicalProperties.line.solidFill = color
-                chart.series.append(curve)
                 x = [r[x_key] for r in points]
-                y = [r[prefix + '_' + metric] for r in points]
+                y = [r[prefix + '_' + metric] if r[prefix + '_' + metric] is not None else np.nan
+                     for r in points]
                 sd = [r[prefix + '_' + sd_key] for r in points]
                 for target in (ax, single_ax):
                     target.plot(x, y, marker=marker, ms=7 if marker == 's' else 5,
@@ -461,49 +446,14 @@ def export_business_summary(output, runs, metadata, summary):
                     if all(v is not None for v in sd):
                         target.errorbar(x, y, yerr=sd, fmt='none', capsize=3, color='#' + color)
             if blocking:
-                chart.y_axis.numFmt = '0%'
                 for target in (ax, single_ax):
                     target.yaxis.set_major_formatter(PercentFormatter(1))
-                    if len(series) > 1 and all(r['ff_blocking_rate'] is not None
-                           and all(r[prefix + '_blocking_rate'] == r['ff_blocking_rate'] for prefix, *_ in series)
-                           for r in summary[group]):
-                        target.text(.03, .95, 'Algorithm curves overlap', transform=target.transAxes,
-                                    va='top', fontsize=9, color='#555555')
-            elif metric == 'skr_kbit_s':
-                for baseline_index, (baseline, baseline_label, color) in enumerate(
-                        [('ff', 'FF', '#2563EB'), ('cca', 'CCA', '#CC79A7')]):
-                    comparable = [(index, row) for index, row in enumerate(summary[group])
-                                  if row[baseline + '_skr_kbit_s'] is not None and row[baseline + '_skr_kbit_s'] > 0
-                                  and row['greedy_skr_kbit_s'] is not None
-                                  and row['greedy_skr_kbit_s'] > row[baseline + '_skr_kbit_s']]
-                    if comparable:
-                        index, best = max(comparable, key=lambda pair:
-                            (pair[1]['greedy_skr_kbit_s'] / pair[1][baseline + '_skr_kbit_s'] - 1, -pair[1][x_key]))
-                        x = best[x_key]
-                        low, high = best[baseline + '_skr_kbit_s'], best['greedy_skr_kbit_s']
-                        label = f'Max SKR gain vs {baseline_label}: +{(high / low - 1):.1%}'
-                        # 两个基准使用分开的文字位置和对应颜色，箭头仍锚定真实工况。
-                        for target in (ax, single_ax):
-                            target.annotate('', xy=(x, high), xytext=(x, low),
-                                            arrowprops=dict(arrowstyle='<->', color=color, lw=1.2))
-                            target.annotate(label, xy=(x, (low + high) / 2),
-                                            xytext=(.03, .97 - .10 * baseline_index), textcoords='axes fraction',
-                                            ha='left', va='top', fontsize=9, color=color,
-                                            arrowprops=dict(arrowstyle='-', color=color, lw=.8),
-                                            bbox=dict(facecolor='white', edgecolor='none', alpha=.85, pad=2))
-                        # Excel 用一个不可见的单点系列承载同一百分比标签，隐藏它的图例项。
-                        excel_row = index + 2
-                        annotation = Series(Reference(sheet, min_col=headers.index('greedy_skr_kbit_s') + 1,
-                                                      min_row=excel_row, max_row=excel_row),
-                                            Reference(sheet, min_col=headers.index(x_key) + 1,
-                                                      min_row=excel_row, max_row=excel_row), title=label)
-                        annotation.graphicalProperties.line.noFill = True
-                        annotation.marker.symbol = 'none'
-                        annotation.dLbls = DataLabelList(showSerName=True, showVal=False,
-                                                        showLegendKey=False, dLblPos='b' if baseline == 'ff' else 't')
-                        chart.legend.legendEntry.append(LegendEntry(idx=len(chart.series), delete=True))
-                        chart.series.append(annotation)
-            sheet.add_chart(chart, f'A{sheet.max_row + 4 + 28 * metric_index}')
+            elif metric in ('skr_kbit_s', 'osnr_db_mean'):
+                label, unit = ('SKR', 'kbit/s') if metric == 'skr_kbit_s' else ('OSNR', 'dB')
+                points = [(row[x_key], row['greedy_' + metric], row['cca_' + metric])
+                          for row in summary[group]]
+                for target in (ax, single_ax):
+                    annotate_max_gap(target, points, label, unit)
             for target in (ax, single_ax):
                 target.set(xlabel=x_label, ylabel=y_label, title=title, ylim=(lower, upper))
                 target.grid(alpha=.2)
@@ -524,8 +474,6 @@ def export_business_summary(output, runs, metadata, summary):
         artifacts.append(vector_path)
         plt.close(fig)
         artifacts.append(overview)
-    workbook.save(path)
-    workbook.close()
     return artifacts
 
 
@@ -533,6 +481,7 @@ def export_scan_results(output, data, save_samples=False):
     """输出 traffic_scan.json、xlsx 和四指标对比 SVG；JSON 始终保留 samples，不重算统计。"""
     (output / 'traffic_scan.json').write_text(
         json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False), encoding='utf-8')
-    export_excel(output / 'traffic_scan.xlsx', data['summary'], data['runs'],
-                 data['samples'], data['config'], save_samples)
+    export_excel(output / 'traffic_scan.xlsx', [('Summary', data['summary'], [
+        ('offered_load_erlang', 'Load (Erlang)'), ('power_dbm', 'Power (dBm)'),
+        ('observed_length_m', 'Link length (m)')])])
     return plot_scan(output, data['summary'], data['config'].get('scan_axis', 'load'))
