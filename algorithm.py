@@ -20,13 +20,13 @@ SCWA 保留奇偶分芯偏好，但修复小网格的阈值和无回退问题：
 但量子/禁用位置不计入占用率。这是可变信道数适配版，不等同于参考原版。
 三芯绑定是硬件实验扩展，使用固定方向分组，不等同于参考单芯 FF。
 GREEDY_MIN_NOISE 直接比较量子接收端的拉曼与 FWM 总噪声增量；
-不做 FWM 组合预筛选、奇偶分级或频差优先。近似同分时使用分芯高低频偏好。
+不做 FWM 组合预筛选、奇偶分级或频差优先。噪声容差内优先选择同向同频的相邻芯占用数较少的候选。
 """
 import numpy as np
 
 
 ALGORITHMS = ('CQLI', 'CCA', 'FF', 'SCWA', 'GREEDY_MIN_NOISE')
-GREEDY_NOISE_RTOL = 0.05
+GREEDY_NOISE_RTOL = 0.10
 
 
 def normalize_algorithm(value):
@@ -36,7 +36,7 @@ def normalize_algorithm(value):
 
 
 class GreedyMinNoise:
-    """以量子接收端总噪声增量为唯一物理评分；近似同分时按分芯频率偏好选择。"""
+    """先限制量子端噪声增量，再优先选择同向同频的相邻芯占用数较少的分配。"""
     def __init__(self, forward_cores, backward_cores, scorer, *, noise_rtol=GREEDY_NOISE_RTOL):
         self.forward = tuple(forward_cores)
         self.backward = tuple(backward_cores)
@@ -45,9 +45,6 @@ class GreedyMinNoise:
         if not np.isfinite(noise_rtol) or not 0 <= noise_rtol <= 1:
             raise ValueError('greedy noise_rtol must be finite and in [0, 1]')
         self.noise_rtol = float(noise_rtol)
-        # 按当前布局的仿真芯索引交错偏好，不改变方向组和芯布局。
-        # 低频芯 2/4/6，高频芯 1/3/5；布局覆盖时芯 0 也归高频。
-        self.low_frequency_cores = frozenset(self.forward + self.backward) & {2, 4, 6}
 
     def _candidate(self, a, b, core, wave, launch_power, resources, powers, distance):
         """返回本跳本芯加入 wave 的量子端总噪声增量 noise（W）及芯编号。
@@ -71,30 +68,31 @@ class GreedyMinNoise:
             total_delta += float(np.sum(after_r-before_r) + np.sum(after_f-before_f))
         return dict(core=core, noise=total_delta)
 
-    def _frequency_penalty(self, core, wave, ranks):
-        """低频组按 Hz 升序、高频组按 Hz 降序计算偏好代价，最好为 0。
+    def _same_direction_count(self, a, b, core, wave, resources):
+        """数本跳最近邻芯上同向、同频的经典占用数，每个占用计1。
 
-        ranks 只含允许的经典频点；多跳代价相加。所有频点仍可用，不硬切频段，
-        不保证相邻芯最终异频，也不引入额外噪声计算。
+        相邻芯使用布局的 first 邻接表；只统计 resources[a,b,邻芯,wave]==2。
+        不计反向、次近邻和量子保留，不按功率或耦合系数加权，不计算串扰噪声。
         """
-        rank = ranks[wave]
-        return rank if core in self.low_frequency_cores else len(ranks) - 1 - rank
+        return sum(int(resources[a, b, neighbor, wave] == 2)
+                   for neighbor in self.scorer.first[core])
 
     def allocate(self, path, launch_power, resources, powers, distances):
         """在给定路径上按总噪声增量选择共同频点和逐跳纤芯。
 
         对每个全路径可用频点，逐跳求最小总噪声增量并相加；再在所有频点之间
         求 Nmin。不设 FWM 安全等级、奇偶优先或频差优先，FWM 仅通过物理功率计分。
-        候选须满足 N <= Nmin+rtol*abs(Nmin)，默认 rtol=1%；Nmin=0 时无绝对容差。
-        每跳仅在该跳相同相对容差内应用高低频偏好，并复核全路径总和不超上述上限；
-        超限则恢复该频点的逐跳最低噪声芯。最终按偏好代价之和、总噪声、频点索引、
-        芯编号排序。rtol=0 时严格最小化本路径的总增量，精确同分仍使用频率偏好。
+        候选须满足 N <= Nmin+rtol*abs(Nmin)，默认 rtol=10%；Nmin=0 时无绝对容差。
+        每跳仅在该跳相同相对容差内选择同向同频邻芯占用数较少的芯，并复核全路径总和不超上述上限；
+        超限则恢复该频点的逐跳最低噪声芯。最终按邻芯占用计数之和、量子噪声增量、频点索引、
+        芯编号排序。rtol=0 时严格最小化本路径的总增量，精确同分仍优先减少同向同频邻芯占用。
         正容差下是逐跳贪心，不穷举芯组合；容差不约束后续仿真的整体 SKR 损失。
 
         路由顺序由 main 决定，本函数不跨候选路径比较分数；全路径同频，可逐跳换芯。
         无可用资源或不足两节点返回 (None,-1)，不因噪声分数增加拒绝条件。
+        重复节点路径、非正或非有限功率报错；仅检查本方向空闲，不追加反向互斥。
         三芯绑定另由 ResourceAllocator._bound_three 直接最小化三芯总增量，
-        不启用分芯频率偏好和相对容差。
+        不启用邻芯占用计数排序和相对容差。
         """
         if len(path) < 2:
             return None, -1
@@ -102,8 +100,6 @@ class GreedyMinNoise:
             raise ValueError('greedy_min_noise requires a simple path')
         if not np.isfinite(launch_power) or launch_power <= 0:
             raise ValueError('Launch power must be finite and positive')
-        indices = np.flatnonzero(np.any((resources == 1) | (resources == 2), axis=(0, 1, 2)))
-        ranks = {int(w): rank for rank, w in enumerate(sorted(indices, key=lambda w: self.frequencies[w]))}
         options = []
         for wave in range(resources.shape[-1]):
             per_hop = []
@@ -111,12 +107,15 @@ class GreedyMinNoise:
                 candidates = [self._candidate(a,b,c,wave,launch_power,resources,powers,distances[a,b])
                               for c in (self.forward if a<b else self.backward)
                               if resources[a,b,c,wave] == 1]
+                for candidate in candidates:
+                    candidate['neighbors'] = self._same_direction_count(
+                        a, b, candidate['core'], wave, resources)
                 if not candidates:
                     break
                 per_hop.append(candidates)
             if len(per_hop) != len(path)-1:
                 continue
-            chosen = [min(hop, key=lambda c: (c['noise'], c['core'])) for hop in per_hop]
+            chosen = [min(hop, key=lambda c: (c['noise'], c['neighbors'], c['core'])) for hop in per_hop]
             options.append(dict(wave=wave, chosen=chosen, per_hop=per_hop))
         if not options:
             return None, -1
@@ -134,12 +133,12 @@ class GreedyMinNoise:
                 local_limit = local_min + self.noise_rtol * abs(local_min)
                 near = [c for c in hop if c['noise'] <= local_limit]
                 chosen.append(min(near, key=lambda c: (
-                    self._frequency_penalty(c['core'], wave, ranks), c['noise'], c['core'])))
+                    c['neighbors'], c['noise'], c['core'])))
             if sum(c['noise'] for c in chosen) > limit:
                 chosen = original
-            preference = sum(self._frequency_penalty(c['core'], wave, ranks) for c in chosen)
+            neighbor_count = sum(c['neighbors'] for c in chosen)
             cores = [c['core'] for c in chosen]
-            key = (preference, sum(c['noise'] for c in chosen), wave, tuple(cores))
+            key = (neighbor_count, sum(c['noise'] for c in chosen), wave, tuple(cores))
             ranked.append((key, cores, wave))
         _, cores, wave = min(ranked, key=lambda candidate: candidate[0])
         return cores, wave
@@ -164,10 +163,10 @@ class ResourceAllocator:
         # 仅实验导出开启；普通仿真和负载扫描仍逐跳选单芯。
         self.bind_three = bind_three
         self.reverse_exclusive = self.algorithm in ('FF', 'CCA') and not bind_three
-        if bind_three and (self.algorithm not in ('FF', 'GREEDY_MIN_NOISE')
+        if bind_three and (self.algorithm not in ('FF', 'CCA', 'GREEDY_MIN_NOISE')
                            or len(self.core_f) != 3 or len(self.core_b) != 3
                            or len(set(self.core_f + self.core_b)) != 6):
-            raise ValueError('Three-core experiments require FF/greedy and two disjoint three-core groups')
+            raise ValueError('Three-core experiments require FF/CCA/greedy and two disjoint three-core groups')
         if self.algorithm == "GREEDY_MIN_NOISE" and quantum_scorer is None:
             raise ValueError(f"{self.algorithm} requires a quantum receiver scorer")
 
@@ -192,11 +191,11 @@ class ResourceAllocator:
         """实验专用：返回 (逐跳三芯成员列表, 共同信道索引)，失败为 (None, -1)。
 
         每跳按节点号选择方向组，三芯全部空闲才可接入，反向资源独立。
-        FF 按实际频率从低到高选第一个可行波长。greedy 直接最小化全路径三芯的
+        FF/CCA 按实际频率从低到高选第一个可行波长；CCA 使用实验专用方向三芯组。greedy 直接最小化全路径三芯的
         拉曼与 FWM 总增量，完全同分时选较小信道索引；保留实际邻接耦合差异。
         现有物理模型按经典芯相加，因此这等于三芯同时加载的增量，不是单芯乘三。
         每芯每信道均加载 launch_power W；仅评分副本，main 的事件负责实际占用。
-        三芯强制同频，本模式不应用分芯高低频偏好或近似噪声容差。
+        三芯强制同频，本模式不应用邻芯占用计数排序或近似噪声容差。
         """
         policy = self.noise_policy
         if len(path) < 2:

@@ -1,8 +1,8 @@
 """从命令行启动共纤仿真：生成经典业务、调用分配算法、占用并释放资源。
 
 运行示例：python main.py --algorithm ALL --slots 5 --arrival-rate 2
-默认 topology7：10 km两节点链路，独立随机生成两个方向的业务。
-普通运行在终端打印结果；--scan-load 和 --export-business 交给 traffic_scan
+默认 topology7：边长取自拓扑文件的两节点链路，独立随机生成两个方向的业务。
+普通运行在终端打印结果；--scan-load/--scan-power/--scan-distance/--scan-all 和 --export-business 交给 traffic_scan
 组织实验。其余脚本是被导入的计算模块，直接运行不会启动仿真。
 
 输入为拓扑 JSON、拉曼系数 XLS 和命令行参数。命令行长度用 km、功率用
@@ -23,7 +23,7 @@ from pathlib import Path
 
 from algorithm import ALGORITHMS, GREEDY_NOISE_RTOL, ResourceAllocator, normalize_algorithm
 from core_layout import cores_code
-from skr_calculation import BB84Parameters, DetectorParameters, QuantumLinkScorer
+from skr_calculation import BB84Parameters, DetectorParameters, QuantumLinkScorer, skr_model_config
 from synergistic_calculation import add_paired_synergy
 from topology import load_topology, distance_matrix, k_shortest_paths, validate_graph
 from noise_calculation import (FiberParameters, MulticoreFiber, RamanSpectrum,
@@ -39,7 +39,7 @@ class SimulationParameters:
     quantum_wave_num 为经典、量子候选信道数；max_frequency/wave_interval
     分别为最高频率和基本网格间隔（Hz）；排除频率后数组可能不再等间隔。
     launch_power 为每经典信道功率 W；seed 固定本实例随机业务序列。
-    greedy_noise_rtol 为单芯 greedy 的相对噪声容差，默认 0.01，无量纲。
+    greedy_noise_rtol 为单芯 greedy 的相对噪声容差，默认 0.10，无量纲。
     """
     core_num: int
     Ts: int
@@ -174,7 +174,7 @@ class ClassicalService:
         """生成实际频率、标记允许使用的资源，并预先计算候选路径。
         
         量子频率排在数组前端；经典频率继续降序排列，跳过指定排除频率并补足
-        候选数。默认量子为 C35，经典为 C34/C32/C31/C30/C29/C28/C27。
+        候选数。默认量子为 C35，10 个经典信道为 C34、C32 至 C24（跳过 C33）。
         节点号小到大为前向、大到小为后向，仅开放对应方向组的经典芯。
         默认 FF/CCA 两方向开放相同的六芯，分配器负责反向同芯同频互斥；
         资源释放仅恢复实际占用方向，另一方向无需修改。
@@ -395,10 +395,15 @@ class ClassicalService:
                               self.first_neighbor, self.secondary_neighbor, self.observed_link)
 
     def run(self):
-        """复用扫描采样；长运行预热 10 时隙，短运行取全部时隙，原始 SKR 不截零。"""
+        """复用扫描采样；长运行预热10时隙，短运行取全部时隙，有限样本SKR逐信道截零。"""
         from traffic_scan import measure_run
         row, _ = measure_run(self, 10 if self.Ts > 10 else 0)
         row['algorithm'] = self.algorithm
+        row['skr_model'] = skr_model_config(self.bb84_params, self.detector_params)
+        print('SKR model:', row['skr_model']['skr_model_version'],
+              'pulses:', self.bb84_params.pulse_count,
+              'gamma:', self.bb84_params.fluctuation_gamma,
+              'stationary block (s):', row['skr_model']['block_duration_s'])
         print('observed link:', self.observed_link, 'length (m):', row['observed_length_m'])
         print('network blocking rate:', row['blocking_rate'])
         print('average link SKR per quantum channel (bit/s):', row['skr_mean'])
@@ -421,38 +426,35 @@ def load_raman_spectrum(path, *, index_center, frequency_step_hz, coefficient_sc
 
 def build_simulation(topology_path, raman_path, *, algorithm="SCWA", slots=100,
                      arrival_rate=7.5, holding_time=4, k=1, seed=53,
-                     classical_channels=7, quantum_channels=1, launch_power=1e-3,
+                     classical_channels=10, quantum_channels=1, launch_power=1e-3,
                      link_length_km=None, core_layout=None, skip_c33=True,
                      greedy_noise_rtol=GREEDY_NOISE_RTOL, bind_three=False, observe_link=None,
-                     observe_link_length_km=None):
+                     observe_link_length_km=None, key_pulses=1e10, key_gamma=5.3):
     """读取输入文件并返回尚未运行的七芯仿真实例；这里集中放置默认物理参数。
     
     topology_path/raman_path 是文件路径；arrival_rate 为每时间单位到达率，
     holding_time 为平均保持时间，launch_power 为 W（与命令行 dBm 不同）。
-    observe_link 指定观测边，默认选择缩放后的最短边，同长度按节点编号字典序选择。
-    选择观测边不改变任何边长；标准缩放下所选最短边为10 km。
-    默认把原拓扑全部边长乘以10/原最短边长，使最短边为10 km并保留长度比例。
-    缩放在路径计算前完成；统一正比例缩放保留路径距离排序。
+    observe_link 指定观测边，默认选择拓扑中的最短边，同长度按节点编号字典序选择。
+    默认直接使用拓扑文件各边的 length_km，不缩放；选择观测边不改变任何边长。
+    观测边在全边覆盖后、单边覆盖前选定；全边等长时按节点编号选边，单边改长后不重选。
+    显式长度覆盖在路径计算前完成，路由与物理计算均使用覆盖后的长度。
     observe_link_length_km 是显式单边覆盖实验；若仅指定全边覆盖 link_length_km，
     则观测边也使用该全边长度。两者都指定时观测边的显式长度优先。
     默认到达率 7.5、保持时间 4，即30 Erlang双向合计普通业务量。
-    命令行默认 topology7 的10 km两节点链路；三芯导出负载扫描为5至40、步长5 Erlang业务组。
+    命令行默认 topology7 的两节点链路，距离读取拓扑文件；三芯导出负载扫描为5至40、步长5 Erlang业务组。
     link_length_km 若提供，只覆盖内存中各边长度。core_layout 可独立指定非 FF
     算法的经典方向组及量子芯布局（显式覆盖属于消融）；FF 基准不受覆盖影响。芯号从零开始：
     默认 FF/CQLI 量子芯为 6，SCWA 为 1，CCA/greedy 为 0。
-    bind_three 仅用于 FF/greedy 硬件回放；FF 此时采用前向 [0,1,2]、后向
-    [3,4,5] 三芯绑定，这是实验约束，不是参考 FF 的六芯共享策略。
-    greedy_noise_rtol 只影响单芯 greedy 的近似同分频率偏好，不改变噪声公式。
+    bind_three 用于 FF/CCA/greedy 三芯回放；FF 前向 [0,1,2]、后向 [3,4,5]；
+    CCA 量子芯0、前向 [1,2,3]、后向 [4,5,6]。这是实验适配，不是参考六芯共享策略。
+    greedy_noise_rtol 只影响单芯 greedy 的量子噪声容差内的同向同频邻芯占用计数排序，不改变噪声公式。
+    key_pulses/key_gamma 为有限样本估算的总发射脉冲数/高斯波动标准差倍数。
+    默认块长1e10在1 GHz下对应静态资源状态10秒，不与仿真时隙或保持时间换算。
     Python 接口默认 algorithm=SCWA、launch_power=1e-3 W；命令行另有默认值。
     """
     graph = load_topology(topology_path)
-    original_min_km = min(data['length_km'] for _, _, data in graph.edges(data=True))
     if link_length_km is None:
-        scale = 10.0 / original_min_km
-        for a, b in graph.edges:
-            graph[a][b]['length_km'] *= scale
-        graph.graph['length_scaling'] = dict(mode='proportional',
-            original_min_km=original_min_km, target_min_km=10.0, factor=scale)
+        graph.graph['length_scaling'] = dict(mode='topology', factor=1.0)
     else:
         graph.graph['length_scaling'] = dict(mode='uniform_override', length_km=link_length_km)
         if not np.isfinite(link_length_km) or link_length_km <= 0:
@@ -487,11 +489,14 @@ def build_simulation(topology_path, raman_path, *, algorithm="SCWA", slots=100,
     if layout not in core_groups:
         raise ValueError(f"Unknown core layout: {core_layout}")
     if bind_three:
-        if algorithm not in ('FF', 'GREEDY_MIN_NOISE') or core_layout is not None:
-            raise ValueError('Three-core export requires FF/greedy without layout overrides')
+        if algorithm not in ('FF', 'CCA', 'GREEDY_MIN_NOISE') or core_layout is not None:
+            raise ValueError('Three-core export requires FF/CCA/greedy without layout overrides')
         if algorithm == 'FF':
             core_groups['FF'] = dict(classical_forward=[0, 1, 2],
                                      classical_backward=[3, 4, 5], quantum=[6])
+        elif algorithm == 'CCA':
+            core_groups['CCA'] = dict(classical_forward=[1, 2, 3],
+                                      classical_backward=[4, 5, 6], quantum=[0])
     params = SimulationParameters(
         core_num=7, Ts=slots, lambda1=arrival_rate, rou1=holding_time, knum=k,
         classical_wave_num=classical_channels, quantum_wave_num=quantum_channels,
@@ -499,10 +504,12 @@ def build_simulation(topology_path, raman_path, *, algorithm="SCWA", slots=100,
         excluded_classical_frequencies_hz=(193.3e12,) if skip_c33 else (),
         greedy_noise_rtol=greedy_noise_rtol,
     )
-    detector = DetectorParameters(efficiency=0.1, gate_time=1e-9,
-                                  insertion_loss_db=8, rate_hz=1e9)
-    bb84 = BB84Parameters(loss_per_m=4.61e-5, dark_count=1e-6, photon_launch=0.1,
-                           error_opt=0.01, sifting_efficiency=0.5, correct_error_eff=1.15)
+    detector = DetectorParameters(efficiency=0.2, gate_time=1e-9,
+                                  insertion_loss_db=8, rate_hz=50e6)
+    # 有限样本诱骗态参数沿用SKR_new.py，探测效率、插损和暗计数保持本项目配置。
+    bb84 = BB84Parameters(loss_per_m=4.61e-5, dark_count=1e-6,
+                           error_opt=0.01, sifting_efficiency=0.5, correct_error_eff=1.15,
+                           pulse_count=key_pulses, fluctuation_gamma=key_gamma)
     fiber_params = FiberParameters(
         loss=0.00004605111673958094,
         loss_c=0.00004605111673958094,
@@ -538,11 +545,11 @@ def build_simulation(topology_path, raman_path, *, algorithm="SCWA", slots=100,
 
 
 def main(argv=None):
-    """解析命令行并选择单次运行、负载扫描或业务回放导出；ALL 的算法范围随模式而定。"""
+    """解析命令行并选择单次运行、负载/功率/距离扫描或业务回放导出；ALL 的算法范围随模式而定。"""
     parser = argparse.ArgumentParser(description="多芯光纤 QKD 共纤资源分配仿真")
     parser.add_argument("--topology", choices=("topology1", "topology6", "topology7"), default="topology7")
     parser.add_argument('--observe-link', type=int, nargs=2, metavar=('U', 'V'),
-                        help='只观测此无向链路，节点从0编号；默认观测缩放后的最短边（同长按节点编号排序），全网照常分配')
+                        help='只观测此无向链路，节点从0编号；默认观测拓扑中的最短边（同长按节点编号排序），全网照常分配')
     parser.add_argument("--algorithm", type=normalize_algorithm,
                         choices=(*ALGORITHMS, "ALL"), default="ALL")
     parser.add_argument("--slots", type=int, default=30)
@@ -551,20 +558,25 @@ def main(argv=None):
     parser.add_argument("--holding-time", type=float, default=4)
     parser.add_argument("--k", type=int, default=1)
     parser.add_argument("--seed", type=int, default=53)
-    parser.add_argument("--classical-channels", type=int, default=7)
+    parser.add_argument("--classical-channels", type=int, default=10,
+                        help="经典候选信道数，默认10；三芯回放同样使用此参数，跳过C33")
     parser.add_argument("--quantum-channels", type=int, default=1)
     parser.add_argument("--include-c33", action="store_true", help="Use the legacy contiguous grid for controlled ablation")
-    parser.add_argument("--launch-power-dbm", type=float, default=10.5)
+    parser.add_argument("--launch-power-dbm", type=float, default=10)
     parser.add_argument("--core-layout", choices=("FF", "CCA", "CQLI", "SCWA"), default=None,
                         help="Override non-baseline core groups; FF baseline always uses its default central quantum core")
     parser.add_argument("--link-length-km", type=float, default=None,
                         help="Override every edge length for controlled sensitivity experiments")
     parser.add_argument('--observe-link-length-km', type=float, default=None,
-                        help='显式覆盖观测边长度/km；默认不单独改边长，全网等比例缩放至最短边10 km')
+                        help='显式覆盖观测边长度/km；默认直接使用拓扑文件中的实际边长')
     base = Path(__file__).resolve().parent
     parser.add_argument("--raman-file", type=Path,
                         default=base / "Ramancrosssection25GHz（25GHz间隔）.xls")
-    parser.add_argument("--scan-load", action="store_true", help="扫描 A=lambda*E[H] 并导出 Excel、JSON、PNG/SVG")
+    parser.add_argument("--scan-load", action="store_true", help="扫描 A=lambda*E[H] 并导出 Excel、JSON、四指标对比 SVG")
+    parser.add_argument("--scan-power", action="store_true", help="固定负载和距离，扫描每芯每信道功率")
+    parser.add_argument("--scan-distance", action="store_true", help="固定负载和功率，扫描全网统一边长")
+    parser.add_argument("--scan-all", action="store_true", help="一次运行负载、功率、距离三组独立扫描")
+    parser.add_argument("--distances", type=float, nargs="+", help="距离扫描点/km，默认 1 5 10 20 30 40 50")
     parser.add_argument("--loads", type=float, nargs="+", default=None,
                         help="双向合计负载/Erlang；普通扫描默认30，三芯回放默认5 10 15 20 25 30 35 40业务组")
     parser.add_argument("--seeds", type=int, nargs="+", default=None,
@@ -574,32 +586,53 @@ def main(argv=None):
                         help="全网边长与每信道功率配对，例如 1:13.5 10:10.5；不指定则使用单次参数")
     parser.add_argument("--output-dir", type=Path, default=None, help="扫描输出目录，默认 results/traffic_scan_时间戳")
     parser.add_argument("--save-samples", action="store_true", help="Excel 中附加预热后的逐时隙样本（JSON始终保留）")
-    parser.add_argument("--export-business", action="store_true", help="导出负载/功率两组业务回放 JSON，仅 FF 与 GREEDY_MIN_NOISE")
-    parser.add_argument("--powers", type=float, nargs='+', help="业务导出的功率扫描点，默认 7 8 9 10 10.5 dBm")
-    parser.add_argument("--fixed-load", type=float, default=None, help="实验功率扫描的固定双向合计三芯组负载/Erlang（默认10）")
+    parser.add_argument("--export-business", action="store_true", help="导出负载/功率两组业务回放 JSON，比较 FF、CCA 与 GREEDY_MIN_NOISE")
+    parser.add_argument("--powers", type=float, nargs='+', help="功率扫描点，默认 7 8 9 10 10.5 dBm")
+    parser.add_argument("--fixed-load", type=float, default=None, help="功率/距离扫描固定负载/Erlang（默认10）；仅业务导出按三芯组计数")
     parser.add_argument("--fixed-power", type=float, default=10.5, help="实验负载扫描的固定每芯每信道功率/dBm")
     parser.add_argument('--greedy-noise-rtol', type=float, default=GREEDY_NOISE_RTOL,
-                        help='单芯 greedy 的相对噪声容差，默认0.01；0仅允许严格同分，三芯绑定不启用')
+                        help='单芯 greedy 的相对噪声容差，默认0.10；0仅允许严格同分，三芯绑定不启用')
+    parser.add_argument("--key-pulses", type=float, default=1e10,
+                        help="有限样本SKR的总发射脉冲数，默认1e10；与仿真时隙数无关")
+    parser.add_argument("--key-gamma", type=float, default=5.3,
+                        help="诱骗态计数高斯波动标准差倍数，默认5.3；不是可组合安全参数")
     args = parser.parse_args(argv)
+    if not math.isfinite(args.key_pulses) or args.key_pulses < 1 or not args.key_pulses.is_integer():
+        parser.error("--key-pulses 必须为有限正整数，可使用1e10形式")
+    if not math.isfinite(args.key_gamma) or args.key_gamma < 0:
+        parser.error("--key-gamma 必须为有限非负数")
     if not np.isfinite(args.greedy_noise_rtol) or not 0 <= args.greedy_noise_rtol <= 1:
         parser.error('--greedy-noise-rtol 必须为 [0,1] 内的有限数')
+    if args.scan_all:
+        args.scan_load = args.scan_power = args.scan_distance = True
+    scanning = args.scan_load or args.scan_power or args.scan_distance
     if args.export_business:
+        if scanning or args.distances is not None:
+            parser.error("--export-business 不与普通负载/功率/距离扫描同时使用")
         from traffic_scan import run_business_export
         try:
             return run_business_export(args, build_simulation, base)
         except ValueError as exc:
             parser.error(str(exc))
-    if args.powers is not None or args.fixed_load is not None or args.fixed_power != 10.5:
-        parser.error("--powers/--fixed-load/--fixed-power 需要 --export-business")
-    if args.scan_load:
-        from traffic_scan import run_load_scan
+    if args.fixed_power != 10.5:
+        parser.error("--fixed-power 需要 --export-business；普通扫描使用 --launch-power-dbm")
+    if args.powers is not None and not args.scan_power:
+        parser.error("--powers 需要 --scan-power 或 --scan-all")
+    if args.distances is not None and not args.scan_distance:
+        parser.error("--distances 需要 --scan-distance 或 --scan-all")
+    if args.fixed_load is not None and not (args.scan_power or args.scan_distance):
+        parser.error("--fixed-load 需要功率或距离扫描")
+    if args.loads is not None and not args.scan_load:
+        parser.error("--loads 需要负载扫描；功率/距离扫描使用 --fixed-load")
+    if scanning:
+        from traffic_scan import run_traffic_scans
         try:
-            return run_load_scan(args, build_simulation, base)
+            return run_traffic_scans(args, build_simulation, base)
         except ValueError as exc:
             parser.error(str(exc))
     if any(value is not None for value in (args.loads, args.seeds, args.warmup,
                                           args.scan_scenarios, args.output_dir)) or args.save_samples:
-        parser.error("业务扫描参数需要与 --scan-load 一起使用")
+        parser.error("业务扫描参数需要与 --scan-load/--scan-power/--scan-distance/--scan-all 一起使用")
     algorithms = ALGORITHMS if args.algorithm == "ALL" else tuple(dict.fromkeys((args.algorithm, "FF")))
     results = []
     for name in algorithms:
@@ -614,6 +647,7 @@ def main(argv=None):
             core_layout=None if name == "FF" else args.core_layout, skip_c33=not args.include_c33,
             greedy_noise_rtol=args.greedy_noise_rtol, observe_link=args.observe_link,
             observe_link_length_km=args.observe_link_length_km,
+            key_pulses=args.key_pulses, key_gamma=args.key_gamma,
         )
         results.append(sim.run())
     add_paired_synergy(results, ())

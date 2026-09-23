@@ -6,18 +6,19 @@
 资源/功率数组为 [源节点, 目的节点, 芯, 信道]，状态 0/1/2/3 为
 不可用/空闲经典/占用经典/量子保留。
 
-BB84_SKR 和 calculate_SKR_all 保留可为负的公式原值；扫描使用
-QuantumLinkScorer.metrics 的 raw_skr，除以所选链路量子信道数后取时间平均。
-metrics 同时保留非负 skr 供资源评分使用，不将它作为导出的参考 SKR。
+正式 SKR 采用用户提供的 SKR_new.py 中 BB84_SKR_finite 双诱骗态估算，
+逐量子信道截零后再求链路和时间平均；raw_skr 仅保留有效界下截零前的差值。
+每个时隙末资源状态按固定脉冲块估算，不把变化的业务轨迹当作一个已采集密钥块。
 只评估节点号小到大的量子接收方向，经典噪声同时包括两个传播方向。
 """
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import lru_cache
 import math
 
 import numpy as np
 
-from noise_calculation import calculate_noise_core, noise_power_to_counts
+from noise_calculation import (calculate_noise_core, noise_power_to_counts,
+                               forward_P_XT, XT_PARAMS)
 
 
 @dataclass(frozen=True)
@@ -39,55 +40,136 @@ class DetectorParameters:
 
 @dataclass(frozen=True)
 class BB84Parameters:
-    """BB84 模型参数：loss_per_m 为指数衰减系数 m^-1（不是 dB/m），
-    dark_count 为每门暗计数项，photon_launch 为每脉冲平均光子数，
-    error_opt 为光学误码比例，sifting_efficiency 为基筛选保留比例，
-    correct_error_eff 为相对理想纠错开销的倍率（至少为 1）。
+    """双诱骗态 BB84 的物理和有限样本参数。
+
+    loss_per_m 为指数衰减系数 m^-1；dark_count 是每个探测器每门暗计数概率。
+    signal/decoy_intensity 为信号态/弱诱骗态的平均光子数；真空态强度为0，
+    概率为1-signal_probability-decoy_probability。pulse_count 是每个量子信道
+    所有强度态的合计发射脉冲数，不是筛选后密钥长度，也不是跨信道共享预算。
+    fluctuation_gamma 为标准差倍数，
+    不直接等于可组合安全参数。沿用参考的均匀选基，筛选效率固定为1/2。
     """
     loss_per_m: float
     dark_count: float
-    photon_launch: float
     error_opt: float
     sifting_efficiency: float
     correct_error_eff: float
+    signal_intensity: float = 0.6
+    decoy_intensity: float = 0.2
+    signal_probability: float = 14 / 16
+    decoy_probability: float = 1 / 16
+    pulse_count: float = 1e10
+    fluctuation_gamma: float = 5.3
 
     def __post_init__(self):
         if (not all(math.isfinite(v) for v in vars(self).values())
-                or self.loss_per_m < 0 or self.dark_count < 0 or self.photon_launch <= 0
-                or not 0 <= self.error_opt <= 1 or not 0 < self.sifting_efficiency <= 1
-                or self.correct_error_eff < 1):
-            raise ValueError("Invalid BB84 parameters")
+                or self.loss_per_m < 0 or not 0 <= self.dark_count < 1
+                or not 0 <= self.error_opt <= 0.5 or self.sifting_efficiency != 0.5
+                or self.correct_error_eff < 1
+                or not 0 < self.decoy_intensity < self.signal_intensity < 1
+                or not 0 < self.signal_probability < 1 or not 0 < self.decoy_probability < 1
+                or self.signal_probability + self.decoy_probability >= 1
+                or self.pulse_count < 1 or not float(self.pulse_count).is_integer()
+                or self.fluctuation_gamma < 0):
+            raise ValueError("Invalid finite-key BB84 parameters")
+
+
+SKR_DEFINITIONS = dict(
+    skr_model_version='two_decoy_gaussian_finite_v1',
+    skr_reference='User-supplied SKR_new.py: BB84_SKR_finite; adapted with existing detector and loss parameters',
+    skr_definition='Time mean of per-channel nonnegative finite-size two-decoy BB84 estimates on the selected link; bit/pulse multiplied by pulse rate once',
+    raw_skr_definition='Pre-clipping finite-size expression when bounds are admissible; zero when bounds fail; diagnostic only, not usable key rate',
+    skr_block_definition='Each sampled resource state is held stationary for the configured pulse block; block duration=N/rate_hz; independent of simulation slots and holding time; not key extraction from a time-varying collected block',
+    skr_security_scope='Gaussian fluctuation estimate on weak-decoy gain/error counts; signal gain and vacuum yield use model expectations; no composable epsilon security claim or phase-error finite-size proof',
+    skr_noise_definition='Existing detector-adjusted per-gate noise used as per-detector background probability, following supplied reference; Y0=1-(1-dark_count-noise)^2; no repeated efficiency/loss conversion',
+)
+
+
+def skr_model_config(params, detector):
+    """返回可复现的模型配置；实际秒数仅指假设静态资源状态下的脉冲块。"""
+    return dict(**SKR_DEFINITIONS, bb84=asdict(params), detector=asdict(detector),
+                vacuum_probability=1-params.signal_probability-params.decoy_probability,
+                block_duration_s=params.pulse_count/detector.rate_hz)
 
 
 def H2(x):
-    """二元熵 -x*log2(x)-(1-x)*log2(1-x)，输入概率 x，端点 0 和 1 的熵均为零。"""
+    """二元熵；概率端点0和1的熵为零。调用方保证物理域0<=x<=1。"""
     if x == 0 or x == 1:
         return 0.0
-    y = -x * math.log2(x) - (1 - x) * math.log2(1 - x)# 调用方传入 0<x<1 的概率
-    return y
-def BB84_SKR(distance, noise, params, detector):
-    """返回 (原始秘密密钥率 bit/s, QBER 比例)，不将负密钥率截为零。
-    
-    distance 为 m；noise 为已经计入探测效率和插入损耗的每门噪声计数，
-    不含暗计数。eta 为信号从发射到探测的总效率，Y0 为背景计数项，
-    Y1 为单光子产额近似，Q1 为单光子增益，Q_ave 为平均检测增益；
-    e1 和 e_ave 分别为单光子及总体误码率。最后乘 rate_hz 换成每秒比特数。
-    这里保留已有渐近 BB84 公式，没有有限密钥长度修正。
+    return -x * math.log2(x) - (1-x) * math.log2(1-x)
+
+
+def BB84_SKR(distance, noise, params, detector, *, clip=True):
+    """返回有限样本估算 (SKR bit/s, 信号态QBER)，默认密钥率非负。
+
+    迁移 SKR_new.py 的 BB84_SKR_finite，不使用其中的 simple 近似分支。
+    distance 为m；noise 沿用项目每门探测后计数的低计数概率近似，已计探测效率
+    和插损、不含暗计数。按参考作为每个探测器背景概率输入两探测器Y0公式。
+    探测效率和插损只在信号eta中另算，不对传入noise重复乘系数。
+
+    Qv下界和EvQv上界用弱诱骗态筛选后样本数 p_decoy*N/2 的高斯波动估算，
+    再求单光子产额下界和误码上界。参考未给信号态/真空态有限置信界、相位误码
+    抽样界及可组合安全扣除项；这是有限样本性能估算，不是完整有限密钥安全证明。
+    理论背景/点击概率超域、单光子下界非正或误码上界>=1/2时返回0。
+    clip=False只供raw_skr诊断有效界下的负差值，界失效时仍返回0。
+    参考函数输出bit/pulse；这里只乘一次rate_hz，供全项目统一使用bit/s。
     """
     if not math.isfinite(distance) or distance < 0 or not math.isfinite(noise) or noise < 0:
         raise ValueError("Distance and noise must be finite and nonnegative")
-    # noise 是单光子探测器探测后的噪声计数，已计入探测效率及插入损耗，不含暗计数。
-    eta = detector.efficiency * math.exp(-params.loss_per_m * distance)* 10 ** (-0.1 * detector.insertion_loss_db)
-    e0 = 1 / 2
-    Y0 = params.dark_count + noise
-    Y1 = Y0 + eta
-    Q1 = Y1 * params.photon_launch * math.exp(-params.photon_launch)
-    Q_ave = Y0 + 1 - math.exp(-eta * params.photon_launch)
-    e1 = (e0 * Y0 + params.error_opt * eta) / Y1
-    e_ave = (e0 * Y0 + params.error_opt * (1 - math.exp(-eta * params.photon_launch))) / Q_ave
-    skr = params.sifting_efficiency * (-Q_ave * params.correct_error_eff * H2(e_ave) + Q1 * (1 - H2(e1)))
-    qber = e_ave
-    return skr*detector.rate_hz, qber
+    eta = detector.efficiency * math.exp(-params.loss_per_m * distance) * 10 ** (-0.1 * detector.insertion_loss_db)
+    background = params.dark_count + noise
+    if background >= 1:
+        return 0.0, 0.5
+    y0 = 1 - (1-background) ** 2
+    u, v = params.signal_intensity, params.decoy_intensity
+    signal_clicks = -math.expm1(-eta*u)
+    decoy_clicks = -math.expm1(-eta*v)
+    qu, qv = y0 + signal_clicks, y0 + decoy_clicks
+    if not (0 < qu <= 1 and 0 < qv <= 1):
+        return 0.0, 0.5
+    eu = (0.5*y0 + params.error_opt*signal_clicks) / qu
+    evqv = 0.5*y0 + params.error_opt*decoy_clicks
+    n_decoy_basis = params.decoy_probability * params.pulse_count / 2
+    qv_lower = max(qv - params.fluctuation_gamma * math.sqrt(qv/n_decoy_basis), 0.0)
+    evqv_upper = evqv + params.fluctuation_gamma * math.sqrt(evqv/n_decoy_basis)
+    y1_lower = u / (u*v - v*v) * (
+        qv_lower*math.exp(v) - (v*v/(u*u))*qu*math.exp(u)
+        - ((u*u-v*v)/(u*u))*y0)
+    if y1_lower <= 0:
+        return 0.0, eu
+    e1_upper = (evqv_upper*math.exp(v) - 0.5*y0) / (v*y1_lower)
+    if not 0 <= e1_upper < 0.5:
+        return 0.0, eu
+    q1_lower = y1_lower*u*math.exp(-u)
+    per_pulse = params.signal_probability * params.sifting_efficiency * (
+        -qu*params.correct_error_eff*H2(eu) + q1_lower*(1-H2(e1_upper)))
+    return (max(0.0, per_pulse) if clip else per_pulse)*detector.rate_hz, eu
+
+
+def synergy_skr_bounds(distance, classical_core_count, launch_power, quantum_frequencies,
+                       params, detector):
+    """返回协同度的 SKR 标尺及串扰条件；距离 m、功率 W、频率 Hz、SKR bit/s。
+
+    上限为零外加噪声 SKR，仍保留暗计数和有限样本惩罚。下限假设每个量子信道
+    受到 N_classical-1 个同功率正向串扰源，每源耦合系数固定为 1e-6 km^-1。
+    N_classical 由调用方按前后向经典芯集合的并集计数，不重复计算双向共享芯。
+    quantum_frequencies 按实际量子芯/信道逐项传入；逐项截零后求平均。
+    串扰功率通过正式 noise_power_to_counts 转为探测后每门计数，不使用历史 SDM
+    接口的额外 1/2 因子。这是假设归一化标尺，不向实际量子噪声模型加入串扰。
+    经典芯不足1或量子频率列表为空时抛错；单经典芯或零功率会使上下限重合。
+    """
+    source_count = classical_core_count - 1
+    if source_count < 0 or len(quantum_frequencies) == 0:
+        raise ValueError('SKR bounds require classical cores and quantum channels')
+    xt_power = source_count * forward_P_XT(1e-6, distance, launch_power, XT_PARAMS)
+    counts = noise_power_to_counts(xt_power, quantum_frequencies, detector)
+    lower = float(np.mean([BB84_SKR(distance, float(noise), params, detector)[0]
+                           for noise in counts]))
+    upper = BB84_SKR(distance, 0.0, params, detector)[0]
+    return dict(synergy_skr_lower=lower, synergy_skr_upper=upper,
+                synergy_classical_core_count=classical_core_count,
+                synergy_xt_source_count=source_count, synergy_xt_power_w=xt_power,
+                synergy_reference_launch_power_w=launch_power)
 
 
 def _validate_inputs(resource_map, powers, distances_m, frequencies_hz,
@@ -164,7 +246,7 @@ class QuantumLinkScorer:
     """量子接收端的物理评估器，不负责选择或占用资源。
 
     core_components() 为候选分配提供分芯的拉曼/FWM 噪声，并缓存相同输入；
-    metrics() 汇总整条链路的噪声、原始/非负 SKR 和零 SKR 信道数。
+    metrics() 汇总整条链路的噪声、有限样本截零前/非负 SKR 和零 SKR 信道数。
     仿真实例通过 quantum_scorer 持有它，分配策略和统计模块共同复用。
     """
 
@@ -216,9 +298,9 @@ class QuantumLinkScorer:
         """评估一条无向链路，输入两方向的 [芯, 信道] 资源和功率，以及长度 m。
         
         forward 对应小节点到大节点的量子接收方向。返回 skr（逐信道非负后求和）、
-        raw_skr（公式原值之和）、拉曼/FWM 功率 W、每门噪声计数之和及量子信道计数。
+        raw_skr（有效有限样本界下截零前差值之和，界失效记0）、拉曼/FWM 功率 W、每门噪声计数之和及量子信道计数。
         no_fwm_skr 仅在同一资源状态中去掉 FWM；zero_noise_skr 去掉外加噪声但保留
-        暗计数；这两项辅助指标逐信道截零，区别于导出的原始 skr/raw_skr。
+        暗计数；这两项与正式skr均使用同一有限样本模型并逐信道截零。
         二者都是 bit/s 的假设计算，不是其他算法实际分配的结果。
         """
         result = dict(skr=0.0, raw_skr=0.0, no_fwm_skr=0.0, zero_noise_skr=0.0,
@@ -238,7 +320,7 @@ class QuantumLinkScorer:
             counts = noise_power_to_counts(ram + fwm, self.frequencies[qi], self.detector)
             rcounts = noise_power_to_counts(ram, self.frequencies[qi], self.detector)
             for count, rcount in zip(counts, rcounts):
-                raw = BB84_SKR(distance, float(count), self.bb84, self.detector)[0]
+                raw = BB84_SKR(distance, float(count), self.bb84, self.detector, clip=False)[0]
                 result['quantum_channels'] += 1
                 result['zero_skr_channels'] += int(raw <= 0)
                 result['raw_skr'] += raw

@@ -19,7 +19,8 @@ channel_index、frequency_hz 和 wavelength_nm。cores 为零起始仿真编号�
 
 occupancy 的维度为 [有向链路, 仿真芯, 经典信道]，链路顺序见 directed_links。
 -2 表示该方向不可用，-1 表示空闲，非负整数为占用业务 ID（0 也表示占用）。
-量子资源只写在 config 中；经典索引从 0 开始，默认对应 C34/C32/C31/C30/C29/C28/C27，
+量子资源只写在 config 中；经典索引从 0 开始，长度由经典信道数决定，
+默认 10 个对应 C34、C32 至 C24（跳过 C33），
 不是 ITU 编号，也不是包含量子频率的仿真内部索引。channel_spacing_hz 只是
 基础网格间隔，跳过 C33 后应读取实际 classical_frequencies_hz。
 
@@ -36,6 +37,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+from skr_calculation import skr_model_config
 
 
 TRACE_SCHEMA_VERSION = 2
@@ -87,6 +90,7 @@ class TrafficRecorder:
             classical_frequencies_hz=[int(f) for f in sim.available_channel[sim.quantum_wave_num:]],
             channel_spacing_hz=int(sim.wave_interval),
             end_policy='release_at_horizon',
+            skr_model=skr_model_config(sim.bb84_params, sim.detector_params),
         )
         self.initial = deepcopy(self.occupancy)
         self.active = {}
@@ -292,11 +296,14 @@ def export_excel(path, summary, runs, samples, metadata, save_samples=False, *, 
     workbook.save(path)
 
 
-def plot_scan(output, summary):
-    """按场景画 OSNR、协同度、SKR、阻塞率、承载量、噪声和增益，返回生成的文件名列表。
+def plot_scan(output, summary, scan_axis='load'):
+    """负载扫描每场景一张、功率/距离扫描每组一张 2×2 SVG：协同度、OSNR、SKR 和阻塞率。
 
-    只使用 summary 的均值和标准差，不从回放重算。40% 增益虚线是预设研究
-    参考目标，不代表实测达到，也不是算法约束；诊断图展示零 SKR 比例。
+    只使用 summary 的均值和跨种子样本标准差，不从回放重算。
+    横轴由 scan_axis 选择负载/Erlang、每芯每信道功率/dBm 或统一边长/km。SKR 从 bit/s 转为 kbit/s，阻塞率显示为百分比。
+    标准差有有限值时绘制阴影；调用方将单种子标准差设为空，缺失值保留断点。
+    SKR 面板标注 greedy 相对 FF 的最大正提升（跨种子均值之比减1）；
+    同分选较小横轴值，FF 非正或缺失时跳过，无正提升不标注。返回 SVG 文件名列表。
     """
     import matplotlib
     matplotlib.use('Agg')
@@ -307,146 +314,61 @@ def plot_scan(output, summary):
               'CQLI': '#E69F00', 'CCA': '#CC79A7'}
     frame = pd.DataFrame(summary)
     artifacts = []
-    for index, (scenario, group) in enumerate(frame.groupby('scenario', sort=False), 1):
-        fig, axes = plt.subplots(3, 3, figsize=(16, 12), layout='constrained')
-        specs = [('osnr_db_mean', 'Reference link OSNR (dB)', 1),
-                 ('synergy_vs_FF', 'Reference synergy vs first-fit', 1),
+    x_key, x_label = {
+        'load': ('offered_load_erlang', 'Offered traffic (Erlang)'),
+        'power': ('power_dbm', 'Power per core per channel (dBm)'),
+        'distance': ('length_km', 'Uniform link length (km)'),
+    }[scan_axis]
+    # 物理量扫描必须将不同场景的点连成一条曲线；配对统计仍在各场景内完成。
+    groups = frame.groupby('scenario', sort=False) if scan_axis == 'load' else [(
+        f"{scan_axis.capitalize()} sweep | A={frame.offered_load_erlang.iloc[0]:g} Erlang | " + (
+            f"observed length={frame.observed_length_m.iloc[0] / 1000:g} km" if scan_axis == 'power'
+            else f"power={frame.power_dbm.iloc[0]:g} dBm/core/channel"), frame)]
+    for index, (scenario, group) in enumerate(groups, 1):
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8), layout='constrained')
+        specs = [('synergy_vs_FF', 'Signed synergy vs first-fit', 1),
+                 ('osnr_db_mean', 'Reference link OSNR (dB)', 1),
                  ('skr_mean', 'Mean link SKR per channel (kbit/s)', .001),
-                 ('blocking_rate', 'Blocking probability', 1),
-                 ('carried_load_erlang', 'Carried traffic (Erlang)', 1),
-                 ('fwm_w_mean', 'FWM at quantum receivers (pW)', 1e12),
-                 ('raman_w_mean', 'Raman at quantum receivers (pW)', 1e12),
-                 ('zero_skr_fraction_mean', 'Zero-SKR fraction', 1)]
+                 ('blocking_rate', 'Blocking probability', 1)]
         for ax, (metric, label, factor) in zip(axes.flat, specs):
             for algorithm, data in group.groupby('algorithm', sort=False):
-                data = data.sort_values('offered_load_erlang')
-                x, y = data['offered_load_erlang'].to_numpy(), data[metric].to_numpy(dtype=float)*factor
+                data = data.sort_values(x_key)
+                x, y = data[x_key].to_numpy(), data[metric].to_numpy(dtype=float)*factor
                 sd = data[metric + '_sd'].to_numpy(dtype=float)*factor
                 color = colors[algorithm]
                 ax.plot(x, y, marker='o', ms=4, lw=1.7, label=algorithm, color=color)
                 if np.isfinite(sd).any():
                     ax.fill_between(x, y - sd, y + sd, color=color, alpha=.12)
             ax.set_ylabel(label)
-        axes[1, 0].yaxis.set_major_formatter(PercentFormatter(1))
-        axes[2, 1].yaxis.set_major_formatter(PercentFormatter(1))
-        axes[0, 1].axhline(0, color="#AAAAAA", lw=.8)
+        greedy = group[group.algorithm == 'GREEDY_MIN_NOISE'].set_index(x_key)
+        baseline = group[group.algorithm == 'FF'].set_index(x_key)
+        paired = greedy[['skr_mean']].join(baseline[['skr_mean']], lsuffix='_greedy', rsuffix='_ff', how='inner')
+        paired = paired[(paired.skr_mean_ff > 0) & (paired.skr_mean_greedy > paired.skr_mean_ff)]
+        if len(paired):
+            gains = (paired.skr_mean_greedy / paired.skr_mean_ff - 1).sort_index()
+            load = gains.idxmax()
+            low, high = paired.loc[load, ['skr_mean_ff', 'skr_mean_greedy']] * .001
+            ax = axes[1, 0]
+            ax.annotate('', xy=(load, high), xytext=(load, low),
+                        arrowprops=dict(arrowstyle='<->', color='#555555', lw=1.2))
+            right_half = load > (group[x_key].min() + group[x_key].max()) / 2
+            ax.annotate(f'Max SKR gain vs FF: +{gains.loc[load]:.2%}',
+                        xy=(load, (low + high) / 2),
+                        xytext=(-12 if right_half else 12, 12), textcoords='offset points',
+                        ha='right' if right_half else 'left', va='bottom', fontsize=9,
+                        bbox=dict(facecolor='white', edgecolor='none', alpha=.85, pad=2))
+        axes[1, 1].yaxis.set_major_formatter(PercentFormatter(1))
+        axes[0, 0].axhline(0, color="#AAAAAA", lw=.8)
         axes[0, 0].legend(fontsize=8)
-        gain = axes[2, 2]
-        new = group[group.algorithm == 'GREEDY_MIN_NOISE'].sort_values('offered_load_erlang')
-        for baseline, marker in [('FF', 'o'), ('SCWA', 's')]:
-            if len(new) and new['gain_vs_' + baseline].notna().any():
-                gain.plot(new.offered_load_erlang, new['gain_vs_' + baseline], marker=marker,
-                          label='vs ' + baseline, color=colors[baseline])
-        gain.axhline(.4, color='#666666', ls='--', lw=1, label='40% target vs FF')
-        gain.axhline(0, color='#AAAAAA', lw=.7)
-        gain.set_ylabel('GREEDY_MIN_NOISE relative SKR gain')
-        gain.yaxis.set_major_formatter(PercentFormatter(1))
-        gain.legend(fontsize=8)
         for ax in axes.flat:
-            ax.set_xlabel('Offered traffic (Erlang)')
+            ax.set_xlabel(x_label)
             ax.grid(alpha=.2)
             ax.spines[['top', 'right']].set_visible(False)
         seeds = int(group.seed_count.iloc[0])
         fig.suptitle(f'{scenario} | {seeds} seed(s) | shaded: across-seed SD', fontsize=13)
-        for suffix in ('png', 'svg'):
-            path = output / f'traffic_scan_{index}.{suffix}'
-            fig.savefig(path, dpi=180)
-            artifacts.append(path.name)
-        plt.close(fig)
-    # 两个基准分别使用纵轴，便于看清数量级不同的增益。
-    new = frame[frame.algorithm == 'GREEDY_MIN_NOISE']
-    if len(new) and new[['gain_vs_FF', 'gain_vs_SCWA']].notna().any().any():
-        fig, axes = plt.subplots(1, 2, figsize=(10, 4), layout='constrained')
-        for ax, baseline in zip(axes, ('FF', 'SCWA')):
-            for scenario, data in new.groupby('scenario', sort=False):
-                data = data.sort_values('offered_load_erlang')
-                if data['gain_vs_' + baseline].notna().any():
-                    ax.plot(data.offered_load_erlang, data['gain_vs_' + baseline], marker='o', label=scenario)
-            ax.axhline(0, color='#AAAAAA', lw=.8)
-            if baseline == 'FF':
-                ax.axhline(.4, color='#666666', ls='--', lw=1, label='40% target')
-            ax.set(xlabel='Offered traffic (Erlang)', ylabel='SKR gain vs ' + baseline)
-            ax.yaxis.set_major_formatter(PercentFormatter(1))
-            ax.grid(alpha=.2)
-            if ax.get_legend_handles_labels()[0]:
-                ax.legend(fontsize=8)
-        fig.suptitle('GREEDY_MIN_NOISE: ratio of across-seed mean SKR')
-        for suffix in ('png', 'svg'):
-            path = output / f'traffic_gains.{suffix}'
-            fig.savefig(path, dpi=180)
-            artifacts.append(path.name)
-        plt.close(fig)
-    # 直接噪声评分没有“回退”等级，只保留量子信道失效比例诊断。
-    new = frame[frame.algorithm == 'GREEDY_MIN_NOISE']
-    if len(new):
-        fig, ax = plt.subplots(figsize=(6, 4), layout='constrained')
-        for scenario, group in new.groupby('scenario', sort=False):
-            group = group.sort_values('offered_load_erlang')
-            ax.plot(group.offered_load_erlang, group.zero_skr_fraction_mean, marker='o', label=scenario)
-        ax.set(xlabel='Offered traffic (Erlang)', ylabel='Zero-SKR channel samples / all channel samples')
-        ax.yaxis.set_major_formatter(PercentFormatter(1))
-        ax.grid(alpha=.2)
-        ax.legend(fontsize=8)
-        ax.set_ylim(0, max(.01, float(new.zero_skr_fraction_mean.max()) * 1.1))
-        for suffix in ('png', 'svg'):
-            path = output / f'traffic_diagnostics.{suffix}'
-            fig.savefig(path, dpi=180)
-            artifacts.append(path.name)
-        plt.close(fig)
-    artifacts.extend(plot_power_comparison(output, summary))
-    return artifacts
-
-
-def plot_power_comparison(output, summary):
-    """同长度、负载有多个功率点时导出功率对照 PNG/SVG，仅使用本批汇总。
-
-    OSNR 使用参考串扰加固定噪声底；另展示串扰功率。阴影为种子均值的样本标准差，
-    SKR 相对增益是跨种子均值之比，没有误差带。不同长度/负载不连成一条曲线。
-    长度为 None 表示使用当前拓扑边长。缺失指标保留断点，不作零值或连线填补。
-    """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    from matplotlib.ticker import PercentFormatter
-
-    frame = pd.DataFrame(summary)
-    artifacts = []
-    colors = {'FF': '#D55E00', 'SCWA': '#0072B2', 'GREEDY_MIN_NOISE': '#009E73',
-              'CQLI': '#E69F00', 'CCA': '#CC79A7'}
-    specs = [('osnr_db_mean', 'Reference link OSNR (dB)', 1),
-             ('classical_xt_w_mean', 'Mean link XT power (W)', 1),
-             ('skr_mean', 'Mean link SKR per channel (kbit/s)', .001),
-             ('gain_vs_FF', 'Relative SKR gain vs FF', 1),
-             ('synergy_vs_FF', 'Reference synergy vs FF', 1),
-             ('blocking_rate', 'Blocking probability', 1)]
-    for index, ((length, load), group) in enumerate(
-            frame.groupby(['length_km', 'offered_load_erlang'], dropna=False, sort=False), 1):
-        if group.power_dbm.nunique() < 2:
-            continue
-        fig, axes = plt.subplots(2, 3, figsize=(15, 8), layout='constrained')
-        for ax, (metric, label, factor) in zip(axes.flat, specs):
-            for algorithm, data in group.groupby('algorithm', sort=False):
-                data = data.sort_values('power_dbm')
-                x = data.power_dbm.to_numpy(dtype=float)
-                y = data[metric].to_numpy(dtype=float) * factor
-                ax.plot(x, y, marker='o', ms=4, color=colors[algorithm], label=algorithm)
-                if metric + '_sd' in data:
-                    sd = data[metric + '_sd'].to_numpy(dtype=float) * factor
-                    ax.fill_between(x, y-sd, y+sd, color=colors[algorithm], alpha=.10)
-            ax.set(xlabel='Launch power per core/channel (dBm)', ylabel=label)
-            ax.grid(alpha=.2)
-            ax.spines[['top', 'right']].set_visible(False)
-        axes[0, 0].legend(fontsize=8)
-        axes[1, 0].yaxis.set_major_formatter(PercentFormatter(1))
-        axes[1, 2].yaxis.set_major_formatter(PercentFormatter(1))
-        axes[1, 0].axhline(0, color='#999999', lw=.8)
-        axes[1, 1].axhline(0, color='#999999', lw=.8)
-        distance = 'Topology edge lengths' if pd.isna(length) else f'{length:g} km per edge'
-        fig.suptitle(f'{distance} | {load:g} Erlang | {int(group.seed_count.iloc[0])} seeds | shaded: seed SD')
-        for suffix in ('png', 'svg'):
-            path = output / f'power_comparison_{index}.{suffix}'
-            fig.savefig(path, dpi=180)
-            artifacts.append(path.name)
+        path = output / f'traffic_scan_{index}.svg'
+        fig.savefig(path)
+        artifacts.append(path.name)
         plt.close(fig)
     return artifacts
 
@@ -455,11 +377,11 @@ def export_business_summary(output, runs, metadata, summary):
     """用本批统计生成 Excel 和 OSNR/协同度/SKR/阻塞率的 PNG、SVG，返回相对输出目录的文件名。
 
     每组输出 OSNR/协同度/SKR/阻塞率趋势，另有两组并排的总览图。
-    Excel 中 OSNR 图排在最前，协同度采用参考非负定义。Excel 使用可编辑的
+    Excel 中 OSNR 图排在最前，协同度仅在 OSNR 和 SKR 均严格提高时取正幅值。Excel 使用可编辑的
     数值横轴图，标准差列保留在表里；PNG 显示误差棒。重合曲线不人为平移。
-    阻塞率图不画阈值线。每张 SKR 图只标注 greedy 相对 FF 的最大正提升：
-    (greedy 的种子均值 / FF 的种子均值 - 1)。FF 非正或任一值缺失时不计算，
-    无正提升则不标；同分选横坐标较小的点。PNG 单图、总览和 Excel 共用该选择。
+    阻塞率图不画阈值线。每张 SKR 图分别标注 greedy 相对 FF、CCA 的最大正提升：
+    (greedy 的种子均值 / 基准的种子均值 - 1)。基准非正或任一值缺失时不计算，
+    无正提升则不标；同分选横坐标较小的点。PNG/SVG 单图、总览和 Excel 共用该选择。
     标注由本次数据自动生成，不写死负载或百分比。
     """
     import openpyxl
@@ -477,17 +399,19 @@ def export_business_summary(output, runs, metadata, summary):
         ('power_scan', 'PowerSweep', 'power_dbm', 'Power per core per channel (dBm)',
          f"Power sweep | {metadata['fixed_load_erlang']:g} Erlang of three-core groups")]
     series = [('ff', 'first-fit', '2563EB', 'o', '-'),
+              ('cca', 'CCA', 'CC79A7', '^', '-.'),
               ('greedy', 'greedy_min_noise', 'D97706', 's', '--')]
+    series = [item for item in series if any(r['algorithm'] == ('first-fit' if item[0] == 'ff' else 'greedy_min_noise' if item[0] == 'greedy' else 'cca') for r in runs)]
     path = output / 'skr_summary.xlsx'
     export_excel(path, [], runs, [], metadata,
                  summary_tables=[(sheet, summary[group]) for group, sheet, *_ in specs])
     workbook = openpyxl.load_workbook(path)
     artifacts = ['skr_summary.xlsx']
-    note = (f"10 km bidirectional | slots={metadata['slots']}, warmup={metadata['warmup']} | "
+    note = (f"{runs[0]['observed_length_m'] / 1000:g} km bidirectional | slots={metadata['slots']}, warmup={metadata['warmup']} | "
             f"{len(metadata['seeds'])} seed(s); " +
             ('error bars: across-seed SD' if len(metadata['seeds']) > 1 else 'single-seed trend'))
     metrics = [('osnr_db_mean', 'osnr_db_mean_sd', 'Reference link OSNR (dB)', 'osnr_trends.png', 'classical_osnr.png'),
-               ('synergy_vs_FF', 'synergy_vs_FF_sd', 'Reference synergy vs first-fit', 'synergy_trends.png', 'synergy.png'),
+               ('synergy_vs_FF', 'synergy_vs_FF_sd', 'Signed synergy vs first-fit', 'synergy_trends.png', 'synergy.png'),
                ('skr_kbit_s', 'skr_sd_kbit_s', 'Mean link SKR per channel (kbit/s)', 'skr_trends.png', 'total_skr.png'),
                ('blocking_rate', 'blocking_rate_sd', 'Classical blocking probability',
                 'blocking_trends.png', 'blocking_rate.png')]
@@ -521,7 +445,7 @@ def export_business_summary(output, runs, metadata, summary):
                 curve = Series(values, x_values, title=label)
                 curve.graphicalProperties.line.solidFill = color
                 curve.graphicalProperties.line.prstDash = 'dash' if style == '--' else 'solid'
-                curve.marker.symbol, curve.marker.size = ('square', 7) if marker == 's' else ('circle', 5)
+                curve.marker.symbol, curve.marker.size = ('square', 7) if marker == 's' else ('triangle', 6) if marker == '^' else ('circle', 5)
                 curve.marker.graphicalProperties.noFill = marker == 's'
                 if marker != 's':
                     curve.marker.graphicalProperties.solidFill = color
@@ -540,44 +464,45 @@ def export_business_summary(output, runs, metadata, summary):
                 chart.y_axis.numFmt = '0%'
                 for target in (ax, single_ax):
                     target.yaxis.set_major_formatter(PercentFormatter(1))
-                    if all(r['ff_blocking_rate'] is not None and r['ff_blocking_rate'] == r['greedy_blocking_rate']
+                    if len(series) > 1 and all(r['ff_blocking_rate'] is not None
+                           and all(r[prefix + '_blocking_rate'] == r['ff_blocking_rate'] for prefix, *_ in series)
                            for r in summary[group]):
                         target.text(.03, .95, 'Algorithm curves overlap', transform=target.transAxes,
                                     va='top', fontsize=9, color='#555555')
             elif metric == 'skr_kbit_s':
-                comparable = [(index, row) for index, row in enumerate(summary[group])
-                              if row['ff_skr_kbit_s'] is not None and row['ff_skr_kbit_s'] > 0
-                              and row['greedy_skr_kbit_s'] is not None
-                              and row['greedy_skr_kbit_s'] > row['ff_skr_kbit_s']]
-                if comparable:
-                    index, best = max(comparable, key=lambda pair:
-                        (pair[1]['greedy_skr_kbit_s'] / pair[1]['ff_skr_kbit_s'] - 1, -pair[1][x_key]))
-                    x = best[x_key]
-                    low, high = best['ff_skr_kbit_s'], best['greedy_skr_kbit_s']
-                    label = f'Max SKR gain: +{(high / low - 1):.1%}'
-                    # 两端锚定同一工况下的真实均值；文字向图内偏移，避免边界裁切。
-                    midpoint = (min(r[x_key] for r in summary[group])
-                                + max(r[x_key] for r in summary[group])) / 2
-                    right_half = x > midpoint
-                    for target in (ax, single_ax):
-                        target.annotate('', xy=(x, high), xytext=(x, low),
-                                        arrowprops=dict(arrowstyle='<->', color='#555555', lw=1.2))
-                        target.annotate(label, xy=(x, (low + high) / 2),
-                                        xytext=(-10 if right_half else 10, 0), textcoords='offset points',
-                                        ha='right' if right_half else 'left', va='center', fontsize=9,
-                                        bbox=dict(facecolor='white', edgecolor='none', alpha=.85, pad=2))
-                    # Excel 用一个不可见的单点系列承载同一百分比标签，隐藏它的图例项。
-                    excel_row = index + 2
-                    annotation = Series(Reference(sheet, min_col=headers.index('greedy_skr_kbit_s') + 1,
-                                                  min_row=excel_row, max_row=excel_row),
-                                        Reference(sheet, min_col=headers.index(x_key) + 1,
-                                                  min_row=excel_row, max_row=excel_row), title=label)
-                    annotation.graphicalProperties.line.noFill = True
-                    annotation.marker.symbol = 'none'
-                    annotation.dLbls = DataLabelList(showSerName=True, showVal=False,
-                                                    showLegendKey=False, dLblPos='b')
-                    chart.legend.legendEntry = [LegendEntry(idx=len(chart.series), delete=True)]
-                    chart.series.append(annotation)
+                for baseline_index, (baseline, baseline_label, color) in enumerate(
+                        [('ff', 'FF', '#2563EB'), ('cca', 'CCA', '#CC79A7')]):
+                    comparable = [(index, row) for index, row in enumerate(summary[group])
+                                  if row[baseline + '_skr_kbit_s'] is not None and row[baseline + '_skr_kbit_s'] > 0
+                                  and row['greedy_skr_kbit_s'] is not None
+                                  and row['greedy_skr_kbit_s'] > row[baseline + '_skr_kbit_s']]
+                    if comparable:
+                        index, best = max(comparable, key=lambda pair:
+                            (pair[1]['greedy_skr_kbit_s'] / pair[1][baseline + '_skr_kbit_s'] - 1, -pair[1][x_key]))
+                        x = best[x_key]
+                        low, high = best[baseline + '_skr_kbit_s'], best['greedy_skr_kbit_s']
+                        label = f'Max SKR gain vs {baseline_label}: +{(high / low - 1):.1%}'
+                        # 两个基准使用分开的文字位置和对应颜色，箭头仍锚定真实工况。
+                        for target in (ax, single_ax):
+                            target.annotate('', xy=(x, high), xytext=(x, low),
+                                            arrowprops=dict(arrowstyle='<->', color=color, lw=1.2))
+                            target.annotate(label, xy=(x, (low + high) / 2),
+                                            xytext=(.03, .97 - .10 * baseline_index), textcoords='axes fraction',
+                                            ha='left', va='top', fontsize=9, color=color,
+                                            arrowprops=dict(arrowstyle='-', color=color, lw=.8),
+                                            bbox=dict(facecolor='white', edgecolor='none', alpha=.85, pad=2))
+                        # Excel 用一个不可见的单点系列承载同一百分比标签，隐藏它的图例项。
+                        excel_row = index + 2
+                        annotation = Series(Reference(sheet, min_col=headers.index('greedy_skr_kbit_s') + 1,
+                                                      min_row=excel_row, max_row=excel_row),
+                                            Reference(sheet, min_col=headers.index(x_key) + 1,
+                                                      min_row=excel_row, max_row=excel_row), title=label)
+                        annotation.graphicalProperties.line.noFill = True
+                        annotation.marker.symbol = 'none'
+                        annotation.dLbls = DataLabelList(showSerName=True, showVal=False,
+                                                        showLegendKey=False, dLblPos='b' if baseline == 'ff' else 't')
+                        chart.legend.legendEntry.append(LegendEntry(idx=len(chart.series), delete=True))
+                        chart.series.append(annotation)
             sheet.add_chart(chart, f'A{sheet.max_row + 4 + 28 * metric_index}')
             for target in (ax, single_ax):
                 target.set(xlabel=x_label, ylabel=y_label, title=title, ylim=(lower, upper))
@@ -605,9 +530,9 @@ def export_business_summary(output, runs, metadata, summary):
 
 
 def export_scan_results(output, data, save_samples=False):
-    """输出 traffic_scan.json、xlsx 和 PNG/SVG；JSON 始终保留 samples，不重算统计。"""
+    """输出 traffic_scan.json、xlsx 和四指标对比 SVG；JSON 始终保留 samples，不重算统计。"""
     (output / 'traffic_scan.json').write_text(
         json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False), encoding='utf-8')
     export_excel(output / 'traffic_scan.xlsx', data['summary'], data['runs'],
                  data['samples'], data['config'], save_samples)
-    return plot_scan(output, data['summary'])
+    return plot_scan(output, data['summary'], data['config'].get('scan_axis', 'load'))
