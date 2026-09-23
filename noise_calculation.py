@@ -1,12 +1,11 @@
-"""计算共纤噪声：量子端拉曼/四波混频（FWM），以及经典端光信噪比（OSNR）所需的串扰、芯内噪声与固定噪声底。
+"""计算共纤噪声：量子端拉曼/四波混频（FWM），以及经典端参考光信噪比（OSNR） 所需的串扰与固定噪声底。
 
 本模块由 main 构建模型，skr_calculation 调用量子噪声，main 调用经典 OSNR；
 不读文件、不分配资源。
 频率 Hz、距离 m、发射和噪声功率 W，距离可传数组以同时计算多个长度。
 正式量子评估只汇总最近邻/次近邻经典芯的前后向拉曼与 FWM，远芯被截断为零。
 FWM 仅计算离散频率 fi+fj-fk，未模拟带内展宽、频率漂移或跨芯泵浦混合。
-经典 OSNR 使用同频芯间串扰、同芯同向 FWM、同芯双向自发拉曼散射（SpRS）及固定噪声底。
-SpRS 复用光纤 width（m）接收带宽，默认 0.12 nm；独立 ClassicalFWMScorer 可汇总候选频点功率，
+经典 OSNR 只使用参考同频芯间串扰及 3.21e-9 W 噪声底；独立 ClassicalFWMScorer 可汇总候选频点功率，
 正式分配入口不调用该独立接口。
 
 MulticoreFiber_Multi_Att 和 wave 是正式入口不使用的独立接口。
@@ -94,7 +93,7 @@ class MulticoreFiber:
         beta 为相位失配量 m^-1，z 为正距离数组 m。D=3/6 分别用于两泵浦
         频率相同/不同，判断容差为 1 MHz。这里的 eta 将通常距离振荡项
         sin(beta*z/2)^2 固定为 1，是原实现保留的包络式近似，不是振荡平均值；
-        不能将此结果当作含相位振荡的精确解。经典 OSNR 的芯内 FWM 使用此公式。
+        不能将此结果当作含相位振荡的精确解。独立 ClassicalFWMScorer 使用此公式；经典 OSNR 不计入 FWM。
         """
         if np.abs(fi - fj) < 10 ** 6:
             D = 3  # 如果相等，D=3
@@ -566,55 +565,30 @@ XT_PARAMS = XTParameters(0.2 / 4.343, 1e-3, 0.5e-9, 0.1, 8.0,
                          1550e-9, 6.62e-34, 3e8)
 
 class ClassicalOSNRScorer:
-    """只读计算所选链路的经典等效 OSNR，不参与路由或分配。
+    """只读计算所选链路的参考经典 OSNR，不参与路由或分配。
 
-    两方向所有占用格的接收信号总功率除以噪声总功率；每格噪声含参考 XT、
-    同芯同向 FWM、同芯前后向 SpRS 和 3.21e-9 W 固定底。仅累计占用目标频点，
-    不把空闲候选上的噪声算入分母。FWM 不含反向混合泵浦；SpRS 使用原谱表，
-    包含表中同频系数，复用光纤 width 接收带宽（默认 0.12 nm）。
-    参考反向 XT 仍仅在受扰芯反向同频有功率时加入；反向 SpRS 无此门控。
-    接收信号沿用参考固定损耗 0.2 dB/km，不使用光纤的 loss_c。
-    statistics 中 *_sum_w 为占用格功率总和，noise_per_channel_w 除以占用格数；
-    历史字段 zero_noise_channels 仅指 XT 为零，并非总噪声为零。
-    空闲返回 None。量子 SKR 独立计算；此扩展不再等同于参考 XT-only OSNR。
+    参考业务入口先对占用信道的串扰求均值，再加固定噪声底 3.21e-9 W。
+    单链路用实际长度、实际发射功率和一跳；两个经典方向的占用格共同平均。
+    保留参考 calculate_noise_core 的判断：反向串扰仅在受扰芯的反向同频
+    功率非零时加入，即使邻芯反向有光也不绕过此判断。FWM/拉曼不计入经典
+    OSNR；量子 SKR 的拉曼/FWM 仍由量子评分器计算。空闲返回 None。
+    接收信号沿用参考固定损耗 0.2 dB/km。statistics 中 *_sum_w 为占用格功率
+    总和，noise_per_channel_w 除以占用格数；zero_noise_channels 仅指 XT 为零。
     """
-    def __init__(self, frequencies, noise_model):
-        self.frequencies = np.asarray(frequencies, dtype=float)
-        self.fiber = noise_model.first_fiber
-        self.raman = noise_model.raman
+    def __init__(self):
         self.statistics = {}
-        self._intra = lru_cache(maxsize=8192)(self._intra_noise)
-
-    def _intra_noise(self, forward, backward, distance):
-        """固定频率下，同芯双向功率元组 W、距离 m；返回各频点 FWM/SpRS 数组 W。"""
-        fiber, raman = self.fiber, self.raman
-        z = np.asarray([distance])
-        forward, backward = np.asarray(forward), np.asarray(backward)
-        _, fwm = fiber.get_fwm_power_all3(
-            self.frequencies, forward, self.frequencies, fiber.get_four_wave_mixing, z)
-        sprs = np.zeros((len(self.frequencies), 1))
-        for powers, function in ((forward, fiber.get_forward_raman_scatter),
-                                 (backward, fiber.get_backward_raman_scatter)):
-            sprs += fiber.get_raman_power_all2(
-                self.frequencies, powers, self.frequencies, function, z,
-                raman.coefficients, raman.index_center, raman.frequency_step_hz)
-        return fwm[:, 0], sprs[:, 0]
 
     def __call__(self, resources, powers, distances, first, secondary, link):
-        """resources/powers 为 [源, 目的, 芯, 信道]；资源值 2 表示经典占用，功率 W。
+        """resources/powers 为 [源, 目的, 芯, 信道]，资源值 2 为经典占用，功率 W。
 
         distances 为 [源, 目的] 距离矩阵（m）；first/secondary 按芯索引给出
-        最近邻/次近邻芯列表，link 为所选无向节点对；返回线性功率比或 None。
+        最近邻/次近邻芯列表，link 为无向节点对；返回线性功率比或 None。
         """
-        signal_sum = xt_sum = fwm_sum = sprs_sum = 0.0
+        signal_sum = xt_sum = 0.0
         count = zero_count = 0
         a, b = link
         length = float(distances[a, b])
         for i, j in ((a, b), (b, a)):
-            intra = {
-                int(c): self._intra(tuple(powers[i, j, c]), tuple(powers[j, i, c]), length)
-                for c in np.flatnonzero(np.any(resources[i, j] == 2, axis=1))
-            }
             for c, w in np.argwhere(resources[i, j] == 2):
                 noise = 0.0
                 for neighbors, coupling in ((first[c], 1e-6), (secondary[c], 1e-7)):
@@ -625,14 +599,12 @@ class ClassicalOSNRScorer:
                             noise += backward_P_XT(coupling, length, float(powers[j, i, neighbor, w]), XT_PARAMS)
                 signal_sum += float(powers[i, j, c, w]) * 10 ** (-length * 0.2 * 1e-4)
                 xt_sum += noise
-                fwm_sum += float(intra[c][0][w])
-                sprs_sum += float(intra[c][1][w])
                 count += 1
                 zero_count += int(noise == 0)
-        noise_sum = xt_sum + fwm_sum + sprs_sum + count * 3.21e-9
+        noise_sum = xt_sum + count * 3.21e-9
         self.statistics = dict(
             signal_sum_w=signal_sum, noise_sum_w=noise_sum, xt_sum_w=xt_sum,
-            fwm_sum_w=fwm_sum, sprs_sum_w=sprs_sum, floor_sum_w=count * 3.21e-9,
+            floor_sum_w=count * 3.21e-9,
             noise_per_channel_w=noise_sum/count if count else None,
             occupied_channels=count, zero_noise_channels=zero_count)
         return signal_sum/noise_sum if count else None

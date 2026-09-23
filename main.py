@@ -162,7 +162,7 @@ class ClassicalService:
         self.rng = random.Random(params.seed)
 
         self.initialize()  # 初始化网络参数
-        self.classical_osnr_scorer = ClassicalOSNRScorer(self.available_channel, self.noise_model)
+        self.classical_osnr_scorer = ClassicalOSNRScorer()
         self.quantum_scorer = QuantumLinkScorer(
             self.available_channel, self.first_neighbor, self.secondary_neighbor,
             self.noise_model, self.detector_params, self.bb84_params)
