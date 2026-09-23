@@ -13,7 +13,10 @@ venv/
 Thumbs.db
 ~$*
 
-# 临时运行核查；正式 results/ 数据应保留
+# 本地实验结果频繁更新，不纳入版本控制
+/results/
+
+# 临时运行核查
 .release_check/
 /.tmp*/
 *.tmp
