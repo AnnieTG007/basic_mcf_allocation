@@ -20,9 +20,9 @@ channel_index、frequency_hz 和 wavelength_nm。cores 为零起始仿真编号�
 occupancy 的维度为 [有向链路, 仿真芯, 经典信道]，链路顺序见 directed_links。
 -2 表示该方向不可用，-1 表示空闲，非负整数为占用业务 ID（0 也表示占用）。
 量子资源只写在 config 中；经典索引从 0 开始，长度由经典信道数决定，
-默认 10 个对应 C34、C32 至 C24（跳过 C33），
+默认 10 个依次对应 C40 至 C36、C34、C32 至 C29（跳过 C33），
 不是 ITU 编号，也不是包含量子频率的仿真内部索引。channel_spacing_hz 只是
-基础网格间隔，跳过 C33 后应读取实际 classical_frequencies_hz。
+基础网格间隔；跨量子频段及跳过 C33 均形成缺口，应读取实际 classical_frequencies_hz。
 
 扫描工作簿含 Summary/Runs/Config，可选 Samples；业务工作簿含
 LoadSweep/PowerSweep/Runs/Config。JSON/Runs 的 SKR 为 bit/s，趋势图和业务

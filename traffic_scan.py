@@ -43,7 +43,7 @@ METRICS = ("skr", "raw_skr", "no_fwm_skr", "zero_noise_skr", "raman_w",
            "fwm_w", "noise_counts", "active_services", "occupied_channels",
            "zero_skr_fraction", "osnr_linear", "zero_xt_channels",
            "classical_received_power_w", "classical_noise_power_w", "classical_noise_per_channel_w",
-           "classical_xt_w", "classical_floor_w")
+           "classical_xt_w", "classical_floor_w", "classical_fwm_w", "classical_sprs_w")
 GROUP = ["scenario", "offered_load_erlang", "algorithm"]
 
 
@@ -135,6 +135,8 @@ def measure_run(sim, warmup, event_recorder=None):
         totals['osnr_db'] = osnr_db(totals['osnr_linear'])
         totals['classical_xt_w'] = classical['xt_sum_w']
         totals['classical_floor_w'] = classical['floor_sum_w']
+        totals['classical_fwm_w'] = classical['fwm_sum_w']
+        totals['classical_sprs_w'] = classical['sprs_sum_w']
         samples.append(totals)
     accepted = offered - blocked_count
     # 空时隙不参与 OSNR 比值平均；SKR 包含空闲时隙。
@@ -339,7 +341,7 @@ def run_load_scan(args, build_simulation, base):
                     observe_link_length_km=args.observe_link_length_km,
                     observed_length_policy='Default: use original topology edge lengths without scaling; explicit uniform or observed-edge overrides are separate experiments; actual observed length stored in runs')
     metadata['metric_units'].update(osnr_linear='power ratio', osnr_db='dB',
-        classical_xt_w='W', classical_floor_w='W',
+        classical_xt_w='W', classical_floor_w='W', classical_fwm_w='W', classical_sprs_w='W',
         synergy_vs_FF='dimensionless')
     metadata['source_sha256'] = source_hashes(base, args.topology, args.raman_file)
     runs, samples, configurations = [], [], {}

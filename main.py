@@ -37,7 +37,7 @@ class SimulationParameters:
     rou1 为平均保持时间（不是离去率），两者乘积为负载 Erlang。
     knum 为每对节点最多保留的候选路径数。classical_wave_num 和
     quantum_wave_num 为经典、量子候选信道数；max_frequency/wave_interval
-    分别为最高频率和基本网格间隔（Hz）；排除频率后数组可能不再等间隔。
+    分别为最高量子频率和基本网格间隔（Hz）；经典信道分布在量子频段两侧。
     launch_power 为每经典信道功率 W；seed 固定本实例随机业务序列。
     greedy_noise_rtol 为单芯 greedy 的相对噪声容差，默认 0.10，无量纲。
     """
@@ -162,7 +162,7 @@ class ClassicalService:
         self.rng = random.Random(params.seed)
 
         self.initialize()  # 初始化网络参数
-        self.classical_osnr_scorer = ClassicalOSNRScorer()
+        self.classical_osnr_scorer = ClassicalOSNRScorer(self.available_channel, self.noise_model)
         self.quantum_scorer = QuantumLinkScorer(
             self.available_channel, self.first_neighbor, self.secondary_neighbor,
             self.noise_model, self.detector_params, self.bb84_params)
@@ -173,8 +173,11 @@ class ClassicalService:
     def initialize(self):  # 初始化
         """生成实际频率、标记允许使用的资源，并预先计算候选路径。
         
-        量子频率排在数组前端；经典频率继续降序排列，跳过指定排除频率并补足
-        候选数。默认量子为 C35，10 个经典信道为 C34、C32 至 C24（跳过 C33）。
+        量子频率排在数组前端；经典信道一半放在量子频段上方，其余放在下方，
+        奇数个时低频侧多一个；两侧均跳过排除频率并补足数量，排除仅作用于经典。
+        多量子信道仍按原网格生成，可能包含 C33。经典段按频率降序
+        存储，算法仍按实际频率升序搜索。默认量子为 C35，经典为 C40 至 C36、
+        C34、C32 至 C29（跳过 C33），共 10 个，基本网格间隔仍为 100 GHz。
         节点号小到大为前向、大到小为后向，仅开放对应方向组的经典芯。
         默认 FF/CCA 两方向开放相同的六芯，分配器负责反向同芯同频互斥；
         资源释放仅恢复实际占用方向，另一方向无需修改。
@@ -183,15 +186,23 @@ class ClassicalService:
             self.max_frequency - w * self.wave_interval
             for w in range(self.quantum_wave_num)
         ]
-        index = self.quantum_wave_num
-        while len(self.available_channel) < self.WaveNumber:
-            frequency = self.max_frequency - index * self.wave_interval
-            index += 1
-            if frequency <= 0:
-                raise ValueError("Not enough positive classical frequencies")
-            if any(abs(frequency - excluded) < 1e5 for excluded in self.excluded_classical_frequencies):
-                continue
-            self.available_channel.append(frequency)
+        classical_frequencies = []
+        high_count = self.classical_wave_num // 2
+        # 高频从最高量子频率上方开始；低频从最低量子频率下方开始，避免重叠。
+        for count, index, step in (
+                (high_count, -1, -1),
+                (self.classical_wave_num - high_count, self.quantum_wave_num, 1)):
+            accepted = 0
+            while accepted < count:
+                frequency = self.max_frequency - index * self.wave_interval
+                index += step
+                if frequency <= 0:
+                    raise ValueError("Not enough positive classical frequencies")
+                if any(abs(frequency - excluded) < 1e5 for excluded in self.excluded_classical_frequencies):
+                    continue
+                classical_frequencies.append(frequency)
+                accepted += 1
+        self.available_channel.extend(sorted(classical_frequencies, reverse=True))
         if min(self.available_channel) <= 0:
             raise ValueError("All channel frequencies must be positive")
 
@@ -559,9 +570,9 @@ def main(argv=None):
     parser.add_argument("--k", type=int, default=1)
     parser.add_argument("--seed", type=int, default=53)
     parser.add_argument("--classical-channels", type=int, default=10,
-                        help="经典候选信道数，默认10；三芯回放同样使用此参数，跳过C33")
+                        help="经典候选信道数，默认10，量子频段两侧各5个；奇数时低频侧多一个，跳过C33")
     parser.add_argument("--quantum-channels", type=int, default=1)
-    parser.add_argument("--include-c33", action="store_true", help="Use the legacy contiguous grid for controlled ablation")
+    parser.add_argument("--include-c33", action="store_true", help="允许低频侧使用C33，保留两侧分布及经典信道总数")
     parser.add_argument("--launch-power-dbm", type=float, default=10)
     parser.add_argument("--core-layout", choices=("FF", "CCA", "CQLI", "SCWA"), default=None,
                         help="Override non-baseline core groups; FF baseline always uses its default central quantum core")
