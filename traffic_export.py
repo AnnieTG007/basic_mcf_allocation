@@ -1,7 +1,8 @@
 """把仿真状态和已算好的统计写成资源回放 JSON、Excel 工作簿与图表。
 
 由 traffic_scan 调用；不生成业务、不决定分配、不推进时间。输出路径由调用方给出。
-回放 kind=qkd_resource_timeline、schema_version=2，config 说明频率、芯分组、
+回放 kind=qkd_resource_timeline、schema_version=2，config.algorithm 含 QCNM 容差标签，
+base_algorithm 为分配算法名、qcnm_noise_rtol 为实际容差；config 还说明频率、芯分组、
 功率 dBm 和仿真时间单位。initial_occupancy 为初始状态，states 为每次资源
 改变后的 {time, event, group_id, occupancy}，包含预热段。终点清空事件为
 horizon_release，带 group_ids，仅结束回放，不冒充自然离去、不改变仿真统计。
@@ -221,6 +222,8 @@ def write_trace(path, data):
 def export_excel(path, tables):
     """写普通黑白汇总表：条件、算法、四项指标及四项相对 first-fit 的比值。
 
+    优先使用统计层附带的 ff_reference；未选 FF 时仍可计算比值而不增加 FF 行。
+
     tables 为 (表名, 已汇总记录, 条件字段) 列表；条件字段是 (键, 显示名) 序列，
     同表内用全部条件配对 FF。记录使用普通扫描的指标键，SKR 输入 bit/s、输出
     kbit/s；OSNR 数值列为 dB，比值使用跨种子平均线性 OSNR，不能相除 dB。
@@ -250,7 +253,7 @@ def export_excel(path, tables):
                     if row['algorithm'] in ('FF', 'first-fit')}
         for row in records:
             key = tuple(row[key] for key, _ in conditions)
-            ref = baseline.get(key, {})
+            ref = row.get('ff_reference', baseline.get(key, {}))
             values = list(key) + [row['algorithm']]
             values += [row[metric] * factor if row[metric] is not None else None
                        for metric, _, factor, _ in metrics]
@@ -271,13 +274,13 @@ def export_excel(path, tables):
 
 
 def annotate_max_gap(ax, points, metric, unit):
-    """points 为 (横轴值, 提出算法值, CCA值)，数值已转换为图中单位。
+    """points 为 (横轴值, 提出算法值, CCA值, 算法标签)，数值已转换为图中单位。
 
     只比较同一横轴、同一场景的有限均值。SKR 选择 |提出算法/CCA-1| 最大点，
     以无符号百分比标注，CCA<=0 时比例未定义，跳过。OSNR 选 dB 绝对差最大点，
     标签保留提出算法减CCA的正负号。同分选较小横轴，全相等标0，缺配对则不标。
     """
-    pairs = [(x, proposed, cca) for x, proposed, cca in points
+    pairs = [(x, proposed, cca, algorithm) for x, proposed, cca, algorithm in points
              if proposed is not None and cca is not None
              and np.isfinite(proposed) and np.isfinite(cca)]
     if not pairs:
@@ -286,11 +289,12 @@ def annotate_max_gap(ax, points, metric, unit):
         pairs = [p for p in pairs if p[2] > 0]
         if not pairs:
             return
-        x, proposed, cca = max(pairs, key=lambda p: (abs(p[1] / p[2] - 1), -p[0]))
+        x, proposed, cca, algorithm = max(pairs, key=lambda p: (abs(p[1] / p[2] - 1), -p[0]))
         label = f'Max SKR difference vs CCA: {abs(proposed / cca - 1):.2%}'
     else:
-        x, proposed, cca = max(pairs, key=lambda p: (abs(p[1] - p[2]), -p[0]))
+        x, proposed, cca, algorithm = max(pairs, key=lambda p: (abs(p[1] - p[2]), -p[0]))
         label = f'Max {metric} gap vs CCA: {proposed - cca:+.3g} {unit}'
+    label = algorithm + '\n' + label
     difference = proposed - cca
     if difference != 0:
         ax.annotate('', xy=(x, proposed), xytext=(x, cca),
@@ -309,17 +313,17 @@ def plot_scan(output, summary, scan_axis='load'):
     横轴由 scan_axis 选择负载/Erlang、每芯每信道功率/dBm 或统一边长/km。SKR 从 bit/s 转为 kbit/s，阻塞率显示为百分比。
     标准差有有限值时绘制阴影；调用方将单种子标准差设为空，缺失值保留断点。
     功率/距离扫描由调用方保证每个横轴值只对应一个场景。
-    仅 SKR、OSNR 面板标注 GREEDY_MIN_NOISE 与 CCA 的最大差：SKR 为绝对
-    百分比差，OSNR 为带符号 dB 差；同分选较小横轴，缺配对不标注。返回 SVG 文件名列表。
+    仅 SKR、OSNR 面板标注 QCNM 与 CCA 的最大差：SKR 为绝对
+    百分比差，OSNR 为带符号 dB 差；在全部容差中选最大差并标出对应容差；同分选较小横轴，缺配对不标注。返回 SVG 文件名列表。
     """
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     from matplotlib.ticker import PercentFormatter
 
-    colors = {'FF': '#D55E00', 'SCWA': '#0072B2', 'GREEDY_MIN_NOISE': '#009E73',
-              'CQLI': '#E69F00', 'CCA': '#CC79A7'}
     frame = pd.DataFrame(summary)
+    colors = {name: plt.get_cmap('tab10')(i % 10)
+              for i, name in enumerate(dict.fromkeys(frame.algorithm))}
     artifacts = []
     x_key, x_label = {
         'load': ('offered_load_erlang', 'Offered traffic (Erlang)'),
@@ -347,14 +351,15 @@ def plot_scan(output, summary, scan_axis='load'):
                 if np.isfinite(sd).any():
                     ax.fill_between(x, y - sd, y + sd, color=color, alpha=.12)
             ax.set_ylabel(label)
-        greedy = group[group.algorithm == 'GREEDY_MIN_NOISE'].set_index(x_key)
         cca = group[group.algorithm == 'CCA'].set_index(x_key)
         for ax, metric, factor, label, unit in (
                 (axes[1, 0], 'skr_mean', .001, 'SKR', 'kbit/s'),
                 (axes[0, 1], 'osnr_db_mean', 1, 'OSNR', 'dB')):
-            paired = greedy[[metric]].join(cca[[metric]], lsuffix='_greedy', rsuffix='_cca', how='inner').astype(float)
-            annotate_max_gap(ax, [(x, row[metric + '_greedy'] * factor, row[metric + '_cca'] * factor)
-                                 for x, row in paired.iterrows()], label, unit)
+            points = [(row[x_key], row[metric] * factor, cca.loc[row[x_key], metric] * factor, row['algorithm'])
+                      for _, row in group.iterrows() if row['algorithm'].startswith('QCNM(')
+                      and row[x_key] in cca.index and pd.notna(row[metric])
+                      and pd.notna(cca.loc[row[x_key], metric])]
+            annotate_max_gap(ax, points, label, unit)
         axes[1, 1].yaxis.set_major_formatter(PercentFormatter(1))
         axes[0, 0].axhline(0, color="#AAAAAA", lw=.8)
         axes[0, 0].legend(fontsize=8)
@@ -376,7 +381,7 @@ def export_business_summary(output, runs, metadata, summary):
 
     工作簿只含条件、算法、四项指标及各自相对FF的比值，不嵌图；完整数据留在JSON。
     图中仅标注提出算法与CCA的最大SKR绝对百分比差、OSNR差（dB），
-    单图和总览共用同一规则。
+    在全部 QCNM 容差中取最大差，并标注对应容差；单图和总览共用同一规则。
     标准差仍显示为误差棒；缺失均值处断线，重合曲线不平移，不添加额外差异标注。
     """
     import matplotlib
@@ -389,25 +394,11 @@ def export_business_summary(output, runs, metadata, summary):
          f"Load sweep | {metadata['fixed_power_dbm']:g} dBm/core/channel"),
         ('power_scan', 'PowerSweep', 'power_dbm', 'Power per core per channel (dBm)',
          f"Power sweep | {metadata['fixed_load_erlang']:g} Erlang of three-core groups")]
-    series = [('ff', 'first-fit', '2563EB', 'o', '-'),
-              ('cca', 'CCA', 'CC79A7', '^', '-.'),
-              ('greedy', 'greedy_min_noise', 'D97706', 's', '--')]
-    series = [item for item in series if any(r['algorithm'] == ('first-fit' if item[0] == 'ff' else 'greedy_min_noise' if item[0] == 'greedy' else 'cca') for r in runs)]
+    algorithms = list(dict.fromkeys(r['algorithm'] for r in runs))
+    colors = {name: plt.get_cmap('tab10')(i % 10) for i, name in enumerate(algorithms)}
     path = output / 'skr_summary.xlsx'
-    tables = []
-    algorithms = {'ff': 'first-fit', 'cca': 'CCA', 'greedy': 'GREEDY_MIN_NOISE'}
-    for group, sheet, *_ in specs:
-        records = []
-        for row in summary[group]:
-            for prefix, *_ in series:
-                record = dict(load_erlang=row['load_erlang'], power_dbm=row['power_dbm'],
-                              algorithm=algorithms[prefix],
-                              skr_mean=row[prefix + '_skr_kbit_s'] * 1000
-                              if row[prefix + '_skr_kbit_s'] is not None else None)
-                for key in ('osnr_db_mean', 'osnr_linear_mean', 'blocking_rate', 'synergy_vs_FF'):
-                    record[key] = row[prefix + '_' + key]
-                records.append(record)
-        tables.append((sheet, records, [('load_erlang', 'Load (Erlang)'), ('power_dbm', 'Power (dBm)')]))
+    tables = [(sheet, summary[group], [('load_erlang', 'Load (Erlang)'), ('power_dbm', 'Power (dBm)')])
+              for group, sheet, *_ in specs]
     export_excel(path, tables)
     artifacts = ['skr_summary.xlsx']
     note = (f"{runs[0]['observed_length_m'] / 1000:g} km bidirectional | slots={metadata['slots']}, warmup={metadata['warmup']} | "
@@ -415,43 +406,39 @@ def export_business_summary(output, runs, metadata, summary):
             ('error bars: across-seed SD' if len(metadata['seeds']) > 1 else 'single-seed trend'))
     metrics = [('osnr_db_mean', 'osnr_db_mean_sd', 'Reference link OSNR (dB)', 'osnr_trends.png', 'classical_osnr.png'),
                ('synergy_vs_FF', 'synergy_vs_FF_sd', 'Signed synergy vs first-fit', 'synergy_trends.png', 'synergy.png'),
-               ('skr_kbit_s', 'skr_sd_kbit_s', 'Mean link SKR per channel (kbit/s)', 'skr_trends.png', 'total_skr.png'),
+               ('skr_mean', 'skr_mean_sd', 'Mean link SKR per channel (kbit/s)', 'skr_trends.png', 'total_skr.png'),
                ('blocking_rate', 'blocking_rate_sd', 'Classical blocking probability',
                 'blocking_trends.png', 'blocking_rate.png')]
     for metric, sd_key, y_label, overview, filename in metrics:
         blocking = metric == 'blocking_rate'
-        upper = max((r[prefix + '_' + metric] + (r[prefix + '_' + sd_key] or 0)
-                     for rows in summary.values() for r in rows for prefix, *_ in series
-                     if r[prefix + '_' + metric] is not None), default=0)
-        lower = min((r[prefix + '_' + metric] - (r[prefix + '_' + sd_key] or 0)
-                     for rows in summary.values() for r in rows for prefix, *_ in series
-                     if r[prefix + '_' + metric] is not None), default=0)
+        factor = .001 if metric == 'skr_mean' else 1
+        upper = max(((r[metric] + (r[sd_key] or 0)) * factor
+                     for rows in summary.values() for r in rows if r[metric] is not None), default=0)
+        lower = min(((r[metric] - (r[sd_key] or 0)) * factor
+                     for rows in summary.values() for r in rows if r[metric] is not None), default=0)
         lower = min(0, lower * 1.08)
         upper = min(1, max(.01, upper) * 1.15) if blocking else max(.01, upper * 1.08)
         fig, axes = plt.subplots(1, 2, figsize=(12, 4.8), layout='constrained')
         for ax, (group, sheet_name, x_key, x_label, title) in zip(axes, specs):
             single, single_ax = plt.subplots(figsize=(7, 4.8), layout='constrained')
-            for prefix, label, color, marker, style in series:
-                points = summary[group]
-                if not any(r[prefix + '_' + metric] is not None for r in points):
-                    continue
+            for algorithm in algorithms:
+                points = sorted((r for r in summary[group] if r['algorithm'] == algorithm), key=lambda r: r[x_key])
                 x = [r[x_key] for r in points]
-                y = [r[prefix + '_' + metric] if r[prefix + '_' + metric] is not None else np.nan
-                     for r in points]
-                sd = [r[prefix + '_' + sd_key] for r in points]
+                y = [r[metric] * factor if r[metric] is not None else np.nan for r in points]
+                sd = [r[sd_key] * factor if r[sd_key] is not None else None for r in points]
                 for target in (ax, single_ax):
-                    target.plot(x, y, marker=marker, ms=7 if marker == 's' else 5,
-                                markerfacecolor='none' if marker == 's' else '#' + color,
-                                ls=style, lw=1.8, label=label, color='#' + color)
+                    target.plot(x, y, marker='o', ms=4, lw=1.8, label=algorithm, color=colors[algorithm])
                     if all(v is not None for v in sd):
-                        target.errorbar(x, y, yerr=sd, fmt='none', capsize=3, color='#' + color)
+                        target.errorbar(x, y, yerr=sd, fmt='none', capsize=3, color=colors[algorithm])
             if blocking:
                 for target in (ax, single_ax):
                     target.yaxis.set_major_formatter(PercentFormatter(1))
-            elif metric in ('skr_kbit_s', 'osnr_db_mean'):
-                label, unit = ('SKR', 'kbit/s') if metric == 'skr_kbit_s' else ('OSNR', 'dB')
-                points = [(row[x_key], row['greedy_' + metric], row['cca_' + metric])
-                          for row in summary[group]]
+            elif metric in ('skr_mean', 'osnr_db_mean'):
+                label, unit = ('SKR', 'kbit/s') if metric == 'skr_mean' else ('OSNR', 'dB')
+                cca = {r[x_key]: r[metric] for r in summary[group] if r['algorithm'] == 'CCA'}
+                points = [(r[x_key], r[metric] * factor, cca[r[x_key]] * factor, r['algorithm'])
+                          for r in summary[group] if r['algorithm'].startswith('QCNM(')
+                          and r[metric] is not None and cca.get(r[x_key]) is not None]
                 for target in (ax, single_ax):
                     annotate_max_gap(target, points, label, unit)
             for target in (ax, single_ax):

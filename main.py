@@ -21,7 +21,7 @@ import argparse
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from algorithm import ALGORITHMS, GREEDY_NOISE_RTOL, ResourceAllocator, normalize_algorithm
+from algorithm import ALGORITHMS, QCNM_NOISE_RTOL, QCNM_NOISE_RTOLS, ResourceAllocator, normalize_algorithm
 from core_layout import cores_code
 from skr_calculation import BB84Parameters, DetectorParameters, QuantumLinkScorer, skr_model_config
 from synergistic_calculation import add_paired_synergy
@@ -39,7 +39,7 @@ class SimulationParameters:
     quantum_wave_num 为经典、量子候选信道数；max_frequency/wave_interval
     分别为最高量子频率和基本网格间隔（Hz）；经典信道分布在量子频段两侧。
     launch_power 为每经典信道功率 W；seed 固定本实例随机业务序列。
-    greedy_noise_rtol 为单芯 greedy 的相对噪声容差，默认 0.10，无量纲。
+    qcnm_noise_rtol 为 QCNM 的相对噪声容差，默认 0.10，无量纲。
     """
     core_num: int
     Ts: int
@@ -53,7 +53,7 @@ class SimulationParameters:
     launch_power: float
     seed: int
     excluded_classical_frequencies_hz: tuple = ()
-    greedy_noise_rtol: float = GREEDY_NOISE_RTOL
+    qcnm_noise_rtol: float = QCNM_NOISE_RTOL
 
 
 class Event:
@@ -168,7 +168,7 @@ class ClassicalService:
             self.noise_model, self.detector_params, self.bb84_params)
         self.allocator = ResourceAllocator(self.algorithm, self.classical_forward_cores,
                                            self.classical_backward_cores, self.available_channel, self.quantum_scorer,
-                                           bind_three=bind_three, noise_rtol=params.greedy_noise_rtol)
+                                           bind_three=bind_three, noise_rtol=params.qcnm_noise_rtol)
 
     def initialize(self):  # 初始化
         """生成实际频率、标记允许使用的资源，并预先计算候选路径。
@@ -176,7 +176,7 @@ class ClassicalService:
         量子频率排在数组前端；经典信道一半放在量子频段上方，其余放在下方，
         奇数个时低频侧多一个；两侧均跳过排除频率并补足数量，排除仅作用于经典。
         多量子信道仍按原网格生成，可能包含 C33。经典段按频率降序
-        存储，算法仍按实际频率升序搜索。默认量子为 C35，经典为 C40 至 C36、
+        存储，FF/CCA/CQLI/SCWA 仍按实际频率升序搜索。默认量子为 C35，经典为 C40 至 C36、
         C34、C32 至 C29（跳过 C33），共 10 个，基本网格间隔仍为 100 GHz。
         节点号小到大为前向、大到小为后向，仅开放对应方向组的经典芯。
         默认 FF/CCA 两方向开放相同的六芯，分配器负责反向同芯同频互斥；
@@ -439,7 +439,7 @@ def build_simulation(topology_path, raman_path, *, algorithm="SCWA", slots=100,
                      arrival_rate=7.5, holding_time=4, k=1, seed=53,
                      classical_channels=10, quantum_channels=1, launch_power=1e-3,
                      link_length_km=None, core_layout=None, skip_c33=True,
-                     greedy_noise_rtol=GREEDY_NOISE_RTOL, bind_three=False, observe_link=None,
+                     qcnm_noise_rtol=QCNM_NOISE_RTOL, bind_three=False, observe_link=None,
                      observe_link_length_km=None, key_pulses=1e10, key_gamma=5.3):
     """读取输入文件并返回尚未运行的七芯仿真实例；这里集中放置默认物理参数。
     
@@ -455,12 +455,12 @@ def build_simulation(topology_path, raman_path, *, algorithm="SCWA", slots=100,
     命令行默认 topology7 的两节点链路，距离读取拓扑文件；三芯导出负载扫描为5至40、步长5 Erlang业务组。
     link_length_km 若提供，只覆盖内存中各边长度。core_layout 可独立指定非 FF
     算法的经典方向组及量子芯布局（显式覆盖属于消融）；FF 基准不受覆盖影响。芯号从零开始：
-    默认 FF/CQLI 量子芯为 6，SCWA 为 1，CCA/greedy 为 0。
-    bind_three 用于 FF/CCA/greedy 三芯回放；FF 前向 [0,1,2]、后向 [3,4,5]；
+    默认 FF/CQLI 量子芯为 6，SCWA 为 1，CCA/QCNM 为 0。
+    bind_three 用于 FF/CCA/QCNM 三芯回放；FF 前向 [0,1,2]、后向 [3,4,5]；
     CCA 量子芯0、前向 [1,2,3]、后向 [4,5,6]。这是实验适配，不是参考六芯共享策略。
-    greedy_noise_rtol 只影响单芯 greedy 的量子噪声容差内的同向同频邻芯占用计数排序，不改变噪声公式。
+    qcnm_noise_rtol 只影响 QCNM 的量子噪声容差内的同向同频邻芯占用计数排序，不改变噪声公式。
     key_pulses/key_gamma 为有限样本估算的总发射脉冲数/高斯波动标准差倍数。
-    默认块长1e10在1 GHz下对应静态资源状态10秒，不与仿真时隙或保持时间换算。
+    默认块长1e10在本项目50 MHz下对应静态资源状态200秒，不与仿真时隙或保持时间换算。
     Python 接口默认 algorithm=SCWA、launch_power=1e-3 W；命令行另有默认值。
     """
     graph = load_topology(topology_path)
@@ -488,7 +488,7 @@ def build_simulation(topology_path, raman_path, *, algorithm="SCWA", slots=100,
     # SCWA 每组第一芯对应奇数频率序号。
     core_groups = {
         "CQLI": {"classical_forward": [0, 2, 4], "classical_backward": [1, 3, 5], "quantum": [6]},
-        "GREEDY_MIN_NOISE": {"classical_forward": [2, 3, 4], "classical_backward": [1, 5, 6], "quantum": [0]},
+        "QCNM": {"classical_forward": [2, 3, 4], "classical_backward": [1, 5, 6], "quantum": [0]},
         "SCWA": {"classical_forward": [4, 3, 5], "classical_backward": [6, 0, 2], "quantum": [1]},
         "CCA": {"classical_forward": [1, 2, 3, 4, 5, 6], "classical_backward": [], "quantum": [0]},
         "FF": {"classical_forward": [0, 1, 2, 3, 4, 5], "classical_backward": [], "quantum": [6]},
@@ -500,8 +500,8 @@ def build_simulation(topology_path, raman_path, *, algorithm="SCWA", slots=100,
     if layout not in core_groups:
         raise ValueError(f"Unknown core layout: {core_layout}")
     if bind_three:
-        if algorithm not in ('FF', 'CCA', 'GREEDY_MIN_NOISE') or core_layout is not None:
-            raise ValueError('Three-core export requires FF/CCA/greedy without layout overrides')
+        if algorithm not in ('FF', 'CCA', 'QCNM') or core_layout is not None:
+            raise ValueError('Three-core export requires FF/CCA/QCNM without layout overrides')
         if algorithm == 'FF':
             core_groups['FF'] = dict(classical_forward=[0, 1, 2],
                                      classical_backward=[3, 4, 5], quantum=[6])
@@ -513,7 +513,7 @@ def build_simulation(topology_path, raman_path, *, algorithm="SCWA", slots=100,
         classical_wave_num=classical_channels, quantum_wave_num=quantum_channels,
         max_frequency=193.5e12, wave_interval=100e9, launch_power=launch_power, seed=seed,
         excluded_classical_frequencies_hz=(193.3e12,) if skip_c33 else (),
-        greedy_noise_rtol=greedy_noise_rtol,
+        qcnm_noise_rtol=qcnm_noise_rtol,
     )
     detector = DetectorParameters(efficiency=0.2, gate_time=1e-9,
                                   insertion_loss_db=8, rate_hz=50e6)
@@ -562,7 +562,8 @@ def main(argv=None):
     parser.add_argument('--observe-link', type=int, nargs=2, metavar=('U', 'V'),
                         help='只观测此无向链路，节点从0编号；默认观测拓扑中的最短边（同长按节点编号排序），全网照常分配')
     parser.add_argument("--algorithm", type=normalize_algorithm,
-                        choices=(*ALGORITHMS, "ALL"), default="ALL")
+                        choices=(*ALGORITHMS, "ALL"), nargs="+", default=None,
+                        help="可多选；扫描/导出默认 QCNM CCA FF，ALL 选择当前模式全部算法")
     parser.add_argument("--slots", type=int, default=30)
     parser.add_argument("--arrival-rate", type=float, default=7.5,
                         help="普通运行的双向合计到达率，默认7.5；保持时间4时为30 Erlang")
@@ -597,12 +598,13 @@ def main(argv=None):
                         help="全网边长与每信道功率配对，例如 1:13.5 10:10.5；不指定则使用单次参数")
     parser.add_argument("--output-dir", type=Path, default=None, help="扫描输出目录，默认 results/traffic_scan_时间戳")
     parser.add_argument("--save-samples", action="store_true", help="兼容旧命令；样本始终保留在JSON，Excel仅输出简表")
-    parser.add_argument("--export-business", action="store_true", help="导出负载/功率两组业务回放 JSON，比较 FF、CCA 与 GREEDY_MIN_NOISE")
+    parser.add_argument("--export-business", action="store_true", help="导出负载/功率两组业务回放 JSON，比较 FF、CCA 与 QCNM")
     parser.add_argument("--powers", type=float, nargs='+', help="功率扫描点，默认 7 8 9 10 10.5 dBm")
     parser.add_argument("--fixed-load", type=float, default=None, help="功率/距离扫描固定负载/Erlang（默认10）；仅业务导出按三芯组计数")
     parser.add_argument("--fixed-power", type=float, default=10.5, help="实验负载扫描的固定每芯每信道功率/dBm")
-    parser.add_argument('--greedy-noise-rtol', type=float, default=GREEDY_NOISE_RTOL,
-                        help='单芯 greedy 的相对噪声容差，默认0.10；0仅允许严格同分，三芯绑定不启用')
+    parser.add_argument('--qcnm-noise-rtol', '--greedy-noise-rtol', dest='qcnm_noise_rtol',
+                        type=float, nargs='+', default=None,
+                        help='QCNM 相对噪声容差，可多选；扫描/导出默认 0 0.1 0.2 0.3 0.4 0.5，普通运行默认0.1')
     parser.add_argument("--key-pulses", type=float, default=1e10,
                         help="有限样本SKR的总发射脉冲数，默认1e10；与仿真时隙数无关")
     parser.add_argument("--key-gamma", type=float, default=5.3,
@@ -612,11 +614,18 @@ def main(argv=None):
         parser.error("--key-pulses 必须为有限正整数，可使用1e10形式")
     if not math.isfinite(args.key_gamma) or args.key_gamma < 0:
         parser.error("--key-gamma 必须为有限非负数")
-    if not np.isfinite(args.greedy_noise_rtol) or not 0 <= args.greedy_noise_rtol <= 1:
-        parser.error('--greedy-noise-rtol 必须为 [0,1] 内的有限数')
+    if args.algorithm and 'ALL' in args.algorithm and len(args.algorithm) > 1:
+        parser.error('ALL 不能与具体算法混用')
+    if args.qcnm_noise_rtol is not None:
+        if any(not np.isfinite(v) or not 0 <= v <= 1 for v in args.qcnm_noise_rtol):
+            parser.error('--qcnm-noise-rtol 必须为 [0,1] 内的有限数')
+        if len(set(args.qcnm_noise_rtol)) != len(args.qcnm_noise_rtol):
+            parser.error('--qcnm-noise-rtol 不能重复')
     if args.scan_all:
         args.scan_load = args.scan_power = args.scan_distance = True
     scanning = args.scan_load or args.scan_power or args.scan_distance
+    if args.qcnm_noise_rtol is None:
+        args.qcnm_noise_rtol = list(QCNM_NOISE_RTOLS) if scanning or args.export_business else [QCNM_NOISE_RTOL]
     if args.export_business:
         if scanning or args.distances is not None:
             parser.error("--export-business 不与普通负载/功率/距离扫描同时使用")
@@ -644,10 +653,13 @@ def main(argv=None):
     if any(value is not None for value in (args.loads, args.seeds, args.warmup,
                                           args.scan_scenarios, args.output_dir)) or args.save_samples:
         parser.error("业务扫描参数需要与 --scan-load/--scan-power/--scan-distance/--scan-all 一起使用")
-    algorithms = ALGORITHMS if args.algorithm == "ALL" else tuple(dict.fromkeys((args.algorithm, "FF")))
+    from traffic_scan import comparison_plan
+    variants = comparison_plan(args, default=ALGORITHMS)
     results = []
-    for name in algorithms:
-        print(f"开始运行算法：{name}，拓扑：{args.topology}")
+    for variant in variants:
+        name = variant["algorithm"]
+        label = variant["label"]
+        print(f"开始运行算法：{label}，拓扑：{args.topology}")
         sim = build_simulation(
             base / "topologies" / f"{args.topology}.json", args.raman_file,
             algorithm=name, slots=args.slots, arrival_rate=args.arrival_rate,
@@ -656,11 +668,13 @@ def main(argv=None):
             launch_power=1e-3 * 10 ** (args.launch_power_dbm / 10),
             link_length_km=args.link_length_km,
             core_layout=None if name == "FF" else args.core_layout, skip_c33=not args.include_c33,
-            greedy_noise_rtol=args.greedy_noise_rtol, observe_link=args.observe_link,
+            qcnm_noise_rtol=variant["qcnm_noise_rtol"] or 0.0, observe_link=args.observe_link,
             observe_link_length_km=args.observe_link_length_km,
             key_pulses=args.key_pulses, key_gamma=args.key_gamma,
         )
-        results.append(sim.run())
+        row = sim.run()
+        row.update(algorithm=label, qcnm_noise_rtol=variant["qcnm_noise_rtol"])
+        results.append(row)
     add_paired_synergy(results, ())
     for row in results:
         if row['algorithm'] != 'FF':

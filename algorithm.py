@@ -19,31 +19,32 @@ SCWA 保留奇偶分芯偏好，但修复小网格的阈值和无回退问题：
 贯通全路径时放开另一集合。序号按全部实际频率升序从 0 编起，包括量子频点，
 但量子/禁用位置不计入占用率。这是可变信道数适配版，不等同于参考原版。
 三芯绑定是硬件实验扩展，使用固定方向分组，不等同于参考单芯 FF。
-GREEDY_MIN_NOISE 直接比较量子接收端的拉曼与 FWM 总噪声增量；
+QCNM（Quantum channel noise mitigation，量子信道噪声抑制）直接比较量子接收端的拉曼与 FWM 总噪声增量；
 不做 FWM 组合预筛选、奇偶分级或频差优先。噪声容差内优先选择同向同频的相邻芯占用数较少的候选。
 """
 import numpy as np
 
 
-ALGORITHMS = ('CQLI', 'CCA', 'FF', 'SCWA', 'GREEDY_MIN_NOISE')
-GREEDY_NOISE_RTOL = 0.10
+ALGORITHMS = ('CQLI', 'CCA', 'FF', 'SCWA', 'QCNM')
+QCNM_NOISE_RTOL = 0.10
+QCNM_NOISE_RTOLS = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5)
 
 
 def normalize_algorithm(value):
-    """统一大小写及连字符；first-fit/FF 统一为 FF，是否支持该名称由调用方检查。"""
+    """统一大小写及连字符；first-fit 归为 FF、旧名 GREEDY_MIN_NOISE 归为 QCNM。"""
     name = value.upper().replace('-', '_')
-    return 'FF' if name == 'FIRST_FIT' else name
+    return {'FIRST_FIT': 'FF', 'GREEDY_MIN_NOISE': 'QCNM'}.get(name, name)
 
 
-class GreedyMinNoise:
+class QuantumChannelNoiseMitigation:
     """先限制量子端噪声增量，再优先选择同向同频的相邻芯占用数较少的分配。"""
-    def __init__(self, forward_cores, backward_cores, scorer, *, noise_rtol=GREEDY_NOISE_RTOL):
+    def __init__(self, forward_cores, backward_cores, scorer, *, noise_rtol=QCNM_NOISE_RTOL):
         self.forward = tuple(forward_cores)
         self.backward = tuple(backward_cores)
         self.scorer = scorer
         self.frequencies = scorer.frequencies.copy()
         if not np.isfinite(noise_rtol) or not 0 <= noise_rtol <= 1:
-            raise ValueError('greedy noise_rtol must be finite and in [0, 1]')
+            raise ValueError('QCNM noise_rtol must be finite and in [0, 1]')
         self.noise_rtol = float(noise_rtol)
 
     def _candidate(self, a, b, core, wave, launch_power, resources, powers, distance):
@@ -91,13 +92,13 @@ class GreedyMinNoise:
         路由顺序由 main 决定，本函数不跨候选路径比较分数；全路径同频，可逐跳换芯。
         无可用资源或不足两节点返回 (None,-1)，不因噪声分数增加拒绝条件。
         重复节点路径、非正或非有限功率报错；仅检查本方向空闲，不追加反向互斥。
-        三芯绑定另由 ResourceAllocator._bound_three 直接最小化三芯总增量，
-        不启用邻芯占用计数排序和相对容差。
+        三芯绑定由 ResourceAllocator._bound_three 对固定三芯组应用同样的
+        全路径噪声上限，再按已有同向同频邻芯占用数、噪声、信道索引排序。
         """
         if len(path) < 2:
             return None, -1
         if len(set(path)) != len(path):
-            raise ValueError('greedy_min_noise requires a simple path')
+            raise ValueError('qcnm requires a simple path')
         if not np.isfinite(launch_power) or launch_power <= 0:
             raise ValueError('Launch power must be finite and positive')
         options = []
@@ -150,7 +151,7 @@ class ResourceAllocator:
     不持有仿真对象或资源快照，不修改传入数组。
     """
     def __init__(self, algorithm, forward_cores, backward_cores, frequencies, quantum_scorer=None,
-                 *, bind_three=False, noise_rtol=GREEDY_NOISE_RTOL):
+                 *, bind_three=False, noise_rtol=QCNM_NOISE_RTOL):
         self.algorithm = normalize_algorithm(algorithm)
         if self.algorithm not in ALGORITHMS:
             raise ValueError(f"Unknown algorithm: {algorithm}")
@@ -163,15 +164,15 @@ class ResourceAllocator:
         # 仅实验导出开启；普通仿真和负载扫描仍逐跳选单芯。
         self.bind_three = bind_three
         self.reverse_exclusive = self.algorithm in ('FF', 'CCA') and not bind_three
-        if bind_three and (self.algorithm not in ('FF', 'CCA', 'GREEDY_MIN_NOISE')
+        if bind_three and (self.algorithm not in ('FF', 'CCA', 'QCNM')
                            or len(self.core_f) != 3 or len(self.core_b) != 3
                            or len(set(self.core_f + self.core_b)) != 6):
-            raise ValueError('Three-core experiments require FF/CCA/greedy and two disjoint three-core groups')
-        if self.algorithm == "GREEDY_MIN_NOISE" and quantum_scorer is None:
+            raise ValueError('Three-core experiments require FF/CCA/QCNM and two disjoint three-core groups')
+        if self.algorithm == "QCNM" and quantum_scorer is None:
             raise ValueError(f"{self.algorithm} requires a quantum receiver scorer")
 
-        self.noise_policy = (GreedyMinNoise(self.core_f, self.core_b, quantum_scorer, noise_rtol=noise_rtol)
-                             if self.algorithm == "GREEDY_MIN_NOISE" else None)
+        self.noise_policy = (QuantumChannelNoiseMitigation(self.core_f, self.core_b, quantum_scorer, noise_rtol=noise_rtol)
+                             if self.algorithm == "QCNM" else None)
 
     def allocate(self, path, launch_power, *, resources, powers, distances):
         """返回 (各跳芯列表, 共同信道索引)，失败为 (None, -1)。
@@ -191,11 +192,13 @@ class ResourceAllocator:
         """实验专用：返回 (逐跳三芯成员列表, 共同信道索引)，失败为 (None, -1)。
 
         每跳按节点号选择方向组，三芯全部空闲才可接入，反向资源独立。
-        FF/CCA 按实际频率从低到高选第一个可行波长；CCA 使用实验专用方向三芯组。greedy 直接最小化全路径三芯的
-        拉曼与 FWM 总增量，完全同分时选较小信道索引；保留实际邻接耦合差异。
+        FF/CCA 按实际频率从低到高选第一个可行波长；CCA 使用实验专用方向三芯组。QCNM 先求全路径三芯的
+        最小拉曼与 FWM 总增量，再在相对噪声容差内最小化已有同向同频邻芯占用计数。
         现有物理模型按经典芯相加，因此这等于三芯同时加载的增量，不是单芯乘三。
         每芯每信道均加载 launch_power W；仅评分副本，main 的事件负责实际占用。
-        三芯强制同频，本模式不应用邻芯占用计数排序或近似噪声容差。
+        三芯强制同频，候选须满足 N <= Nmin + rtol*abs(Nmin)，随后按邻芯计数、
+        噪声、信道索引排序。默认固定方向三芯组中，可用波长的同向邻芯占用均为零，
+        因而不同容差可得到相同结果；不人为改变频率顺序以制造差异。
         """
         policy = self.noise_policy
         if len(path) < 2:
@@ -205,7 +208,7 @@ class ResourceAllocator:
         if not np.isfinite(launch_power) or launch_power <= 0:
             raise ValueError('Launch power must be finite and positive')
         groups = [list(self.core_f if a < b else self.core_b) for a, b in zip(path, path[1:])]
-        best_key, best = None, (None, -1)
+        options = []
         for wave in sorted(range(resources.shape[-1]), key=lambda w: (self.frequencies[w], w)):
             if not all(np.all(resources[a, b, cores, wave] == 1)
                        for a, b, cores in zip(path, path[1:], groups)):
@@ -214,10 +217,16 @@ class ResourceAllocator:
                 return groups, wave
             candidates = [policy._candidate(a, b, c, wave, launch_power, resources, powers, distances[a, b])
                           for a, b, cores in zip(path, path[1:], groups) for c in cores]
-            key = (sum(c['noise'] for c in candidates), wave)
-            if best_key is None or key < best_key:
-                best_key, best = key, (groups, wave)
-        return best
+            noise = sum(c['noise'] for c in candidates)
+            neighbors = sum(policy._same_direction_count(a, b, c, wave, resources)
+                            for a, b, cores in zip(path, path[1:], groups) for c in cores)
+            options.append((neighbors, noise, wave))
+        if not options:
+            return None, -1
+        minimum = min(noise for _, noise, _ in options)
+        limit = minimum + policy.noise_rtol * abs(minimum)
+        _, _, wave = min(option for option in options if option[1] <= limit)
+        return groups, wave
 
     def _first_fit(self, path, resources):
         """FF/CCA/CQLI 先按实际频率从低到高，再选择本跳第一个可用芯。
@@ -253,7 +262,7 @@ class ResourceAllocator:
         对每跳的原首选奇偶集合，仅状态 1/2 算有效经典位置、仅状态 2 算占用。
         占用比例达到 7/12（参考 16 信道名义阈值 14/24）时交换本跳偏好，
         每次到达重新判断；没有有效首选位置时直接偏好互补集合。
-        默认 8 个总频点、1 个量子频点时，首选有效容量为 11，占用 7 个才切换，
+        例如 8 个总频点、1 个量子频点时，首选有效容量为 11，占用 7 个才切换，
         不再因量子预留位置使第一条业务后就切换。比例推广并非原版固定余量 10。
 
         先只在各跳当前首选集合中按低频优先找共同频点；整条路径失败后，重新
