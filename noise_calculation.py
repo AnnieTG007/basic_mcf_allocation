@@ -5,41 +5,84 @@
 频率 Hz、距离 m、发射和噪声功率 W，距离可传数组以同时计算多个长度。
 正式量子评估只汇总最近邻/次近邻经典芯的前后向拉曼与 FWM，远芯被截断为零。
 FWM 仅计算离散频率 fi+fj-fk，未模拟带内展宽、频率漂移或跨芯泵浦混合。
-经典 OSNR 只使用参考同频芯间串扰及 3.21e-9 W 噪声底；独立 ClassicalFWMScorer 可汇总候选频点功率，
-正式分配入口不调用该独立接口。
-
-MulticoreFiber_Multi_Att 和 wave 是正式入口不使用的独立接口。
-XT（线性芯间串扰）用于经典 OSNR，不加入量子噪声汇总；hij 单位为 km^-1。
-现有公式缺少完整可核查的出处记录，参数和近似沿用原实现，不能据此声称
-已完成实验标定。下方注释标明已知限制，不借注释整理改变数值模型。
+经典 OSNR 只使用参考同频芯间串扰及 3.21e-9 W 噪声底。
+FWM、SpRS（自发拉曼散射）、ICXT（线性芯间串扰）按此顺序集中在 MulticoreFiber。
+ICXT 不加入实际量子噪声汇总，仅用于经典 OSNR 和协同度归一化标尺。
+FWM 与芯间传播公式沿用原实现，完整出处尚待确认。拉曼谱改用内置 GNPy 数据，
+用热占据数换算自发噪声；这是物理模型变更，旧 Excel 结果不能当作本版本结果。
 """
-from functools import lru_cache, partial
 from itertools import permutations, combinations
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
+from functools import lru_cache
 import math
 
 import numpy as np
 
 
+# GNPy v3.0.1 的标准单模光纤（SSMF）默认拉曼谱，原始精度不变。
+# 来源：https://github.com/Telecominfraproject/oopt-gnpy/blob/fd32bf544310ac76172224bf2c2054a7d4e6d87a/gnpy/core/parameters.py
+RAMAN_MODEL = 'gnpy_ssmf_thermal_v1'
+GNPY_RAMAN_COMMIT = 'fd32bf544310ac76172224bf2c2054a7d4e6d87a'
+_RAMAN_REFERENCE_HZ = 206184634112792.0  # 原谱参考泵浦频率（1454 nm），不是本光纤面积的参考频率。
+_RAMAN_OFFSET_HZ = np.array([
+    0., 0.5, 1., 1.5, 2., 2.5, 3., 3.5, 4., 4.5, 5., 5.5, 6., 6.5, 7., 7.5, 8., 8.5,
+    9., 9.5, 10., 10.5, 11., 11.5, 12., 12.5, 12.75, 13., 13.25, 13.5, 14., 14.5,
+    14.75, 15., 15.5, 16., 16.5, 17., 17.5, 18., 18.25, 18.5, 18.75, 19., 19.5, 20.,
+    20.5, 21., 21.5, 22., 22.5, 23., 23.5, 24., 24.5, 25., 25.5, 26., 26.5, 27.,
+    27.5, 28., 28.5, 29., 29.5, 30., 30.5, 31., 31.5, 32., 32.5, 33., 33.5, 34.,
+    34.5, 35., 35.5, 36., 36.5, 37., 37.5, 38., 38.5, 39., 39.5, 40., 40.5, 41., 41.5, 42.
+]) * 1e12
+_RAMAN_GAMMA_M_PER_W = np.array([
+    0.0, 8.524419934705497e-16, 2.643567866245371e-15, 4.410548410941305e-15,
+    6.153422961291078e-15, 7.484924703044943e-15, 8.452060808349209e-15, 9.101549322698156e-15,
+    9.57837595158966e-15, 1.0008642675474562e-14, 1.0865773569905647e-14, 1.1300776305865833e-14,
+    1.2143238647099625e-14, 1.3231065750676068e-14, 1.4624900971525384e-14, 1.6013330554840492e-14,
+    1.7458119359310242e-14, 1.9320241330434762e-14, 2.1720395392873534e-14, 2.4137337406734775e-14,
+    2.628163218460466e-14, 2.8041019963285974e-14, 2.9723155447089933e-14, 3.129353531005888e-14,
+    3.251796163324624e-14, 3.3198839487612773e-14, 3.329527690685666e-14, 3.313155691238456e-14,
+    3.289013852154548e-14, 3.2458917188506916e-14, 3.060684277937575e-14, 3.2660349473783173e-14,
+    2.957419109657689e-14, 2.518894321396672e-14, 1.734560485857344e-14, 9.902860761605233e-15,
+    7.219176385099358e-15, 6.079565990401311e-15, 5.828373065963427e-15, 7.20580801091692e-15,
+    7.561924351387493e-15, 7.621152352332206e-15, 6.8859886780643254e-15, 5.629181047471162e-15,
+    3.679727598966185e-15, 2.7555869742500355e-15, 2.4810133942597675e-15, 2.2160080532403624e-15,
+    2.1440626024765557e-15, 2.33873070799544e-15, 2.557317929858713e-15, 3.039839048226572e-15,
+    4.8337165515610065e-15, 5.4647431818257436e-15, 5.229187813711269e-15, 4.510768525811313e-15,
+    3.3213473130607794e-15, 2.2602577027996455e-15, 1.969576495866441e-15, 1.5179853954188527e-15,
+    1.2953988551200156e-15, 1.1304672156251838e-15, 9.10004390675213e-16, 8.432919922183503e-16,
+    7.849224069008326e-16, 7.827568196032024e-16, 9.000514440646232e-16, 1.3025926460013665e-15,
+    1.5444108938497558e-15, 1.8795594063060786e-15, 1.7796130169921014e-15, 1.5938159865046653e-15,
+    1.1585522355108287e-15, 8.507044444633358e-16, 7.625404663756823e-16, 8.14510750925789e-16,
+    9.047944693473188e-16, 9.636431901702084e-16, 9.298633899602105e-16, 8.349739503637023e-16,
+    7.482901278066085e-16, 6.240794767134268e-16, 5.00652535687506e-16, 3.553373263685851e-16,
+    2.0344217706119682e-16, 1.4267522642294203e-16, 8.980016576743517e-17, 2.9829068181832594e-17,
+    1.4861959129014824e-17, 7.404482113326137e-18
+])
+_RAMAN_OFFSET_HZ.setflags(write=False)
+_RAMAN_GAMMA_M_PER_W.setflags(write=False)
+
+
+def raman_model_config():
+    """导出拉曼来源与计算约定；实际温度、面积和滤波宽度随两组光纤参数保存。"""
+    return dict(model=RAMAN_MODEL, source="GNPy 3.0.1 DEFAULT_RAMAN_COEFFICIENT",
+                source_commit=GNPY_RAMAN_COMMIT,
+                source_url=f"https://github.com/Telecominfraproject/oopt-gnpy/blob/{GNPY_RAMAN_COMMIT}/gnpy/core/parameters.py",
+                interpolation="linear", spectrum_reference_frequency_hz=_RAMAN_REFERENCE_HZ,
+                frequency_offset_range_hz=[0.0, float(_RAMAN_OFFSET_HZ[-1])],
+                polarization_modes=2, coefficient_unit="m^-2",
+                thermal_factors="Stokes: n+1; anti-Stokes: n; zero offset: analytic limit",
+                propagation="existing inter-core forward/backward weak-scattering integrals")
+
+
 @dataclass(frozen=True)
-class FiberParameters:
-    """光纤物理参数；默认数值集中在 main.build_simulation。
-    
-    loss/loss_c/loss_q：通用/经典/量子光的指数功率衰减系数，m^-1；
-    D_c：色散参数，s/m^2；D_s：色散斜率，s/m^3；A_eff：有效模场面积 m^2；
-    FW：拉曼谱频率校正的参考频率 Hz；c：光速 m/s；n：折射率；
-    hmn：芯间耦合系数 m^-1；recapture_factor_Rayleigh：瑞利后向俘获比例；
-    loss_Rayleigh：瑞利散射系数 m^-1；width：接收滤波波长宽度 m（不是 Hz）。
-    e3：原公式中的三阶非线性系数；其数值和单位制必须与 gamma 表达式配套，
-    当前项目未提供原始单位制出处，不能直接替换为其他文献的 SI 数值。
-    """
-    loss: float
+# 多芯光纤类，用于噪声计算
+class MulticoreFiber:
+    loss: float  # 通用衰减 m^-1
     loss_c: float
     loss_q: float
     D_c: float
     D_s: float
     A_eff: float
-    FW: float
+    reference_frequency: float
     c: float
     e3: float
     n: float
@@ -47,34 +90,19 @@ class FiberParameters:
     recapture_factor_Rayleigh: float
     loss_Rayleigh: float
     width: float
+    temperature: float
 
     def __post_init__(self):
         if not all(np.isfinite(value) for value in vars(self).values()):
             raise ValueError("Fiber parameters must be finite")
         if any(getattr(self, name) <= 0 for name in
-               ("loss", "loss_c", "loss_q", "A_eff", "FW", "c", "n", "width")):
-            raise ValueError("Fiber loss, area, frequency, speed, index and bandwidth must be positive")
+               ("loss", "loss_c", "loss_q", "A_eff", "reference_frequency", "c", "n", "width", "temperature")):
+            raise ValueError("Fiber loss, area, frequency, speed, index, bandwidth and temperature must be positive")
         if any(getattr(self, name) < 0 for name in
                ("e3", "hmn", "recapture_factor_Rayleigh", "loss_Rayleigh")):
             raise ValueError("Nonlinearity and coupling/scattering coefficients must be nonnegative")
 
-
-@dataclass(frozen=True)
-class MulticoreFiber:
-    """使用一组固定参数计算芯内、芯间的拉曼与 FWM 功率。
-    
-    输入 fi/fj/fk 为三个泵浦频率 Hz，pi/pj/pk 为各自功率 W；z 为正距离
-    一维数组 m。FWM 接口返回 (生成频率 Hz, 各距离处功率数组 W)，拉曼
-    单项接口返回功率数组 W。forward/backward 均相对量子信号传播方向。
-    后缀 all 表示累加各非零功率的经典泵浦，不代表同时计算所有物理效应。
-    """
-
-    params: FiberParameters
-
-    def __getattr__(self, name):
-        return getattr(self.params, name)
-
-    # FWM计算相关
+    # FWM（四波混频）：相位失配、双向功率与目标信道汇总。
     def get_phase_matching_factor(self, fi, fj, fk):
         """由三个泵浦频率 Hz 计算相位失配量 beta（m^-1）。
         
@@ -87,33 +115,7 @@ class MulticoreFiber:
                * (self.D_c + w ** 2 / 2 / self.c * (np.abs(fi - fk) + np.abs(fj - fk)) * self.D_s)
         return beta
 
-    def get_four_wave_mixing(self, fi, fj, fk, pi, pj, pk, beta, z: np.ndarray):
-        """计算三个泵浦在同一芯产生的 FWM，返回 (生成频率 Hz, 功率数组 W)。
-        
-        beta 为相位失配量 m^-1，z 为正距离数组 m。D=3/6 分别用于两泵浦
-        频率相同/不同，判断容差为 1 MHz。这里的 eta 将通常距离振荡项
-        sin(beta*z/2)^2 固定为 1，是原实现保留的包络式近似，不是振荡平均值；
-        不能将此结果当作含相位振荡的精确解。独立 ClassicalFWMScorer 使用此公式；经典 OSNR 不计入 FWM。
-        """
-        if np.abs(fi - fj) < 10 ** 6:
-            D = 3  # 如果相等，D=3
-        else:
-            D = 6  # 如果不相等，D=6
-
-        f_fwm = fi + fj - fk  # 四波混频频率
-        w_fwm = self.c / f_fwm  # 四波混频波长
-        # 保留包络式近似：将正弦平方项固定为 1，详见本函数说明。
-        eta = self.loss ** 2 / (self.loss ** 2 + beta ** 2) \
-              * (1 + (4 * np.exp(-self.loss * z) / (1 - np.exp(-self.loss * z)) ** 2))
-
-        eff_distance = (1 - np.exp(-self.loss * z)) / self.loss
-        gamma = (32 * np.pi ** 3 * self.e3) / (self.n ** 2 * w_fwm * self.c * self.A_eff)
-        p_fwm = eta * (D * gamma) ** 2. * eff_distance ** 2. * pi * pj * pk * np.exp(-self.loss * z)
-
-        return f_fwm, p_fwm
-
     def get_intercore_four_wave_mixing(self, fi, fj, fk, pi, pj, pk, beta, z):
-
         """返回同向经典泵浦产生并耦合到另一芯的 (FWM 频率 Hz, 功率数组 W)，z 为 m。"""
         if np.abs(fi - fj) < 10 ** 6:
             D = 3  # 如果相等，D=3
@@ -121,9 +123,7 @@ class MulticoreFiber:
             D = 6  # 如果不相等，D=6
 
         f_fwm = fi + fj - fk  # 四波混频频率
-        w_fwm = self.c / f_fwm  # 四波混频波长
 
-        gamma = (32 * np.pi ** 3 * self.e3) / (self.n ** 2 * w_fwm * self.c * self.A_eff)
         I = np.exp(-self.loss * z) / (self.loss ** 2 + beta ** 2) \
             * (beta * np.sin(beta * z) - self.loss * np.cos(beta * z))
         C = (beta ** 2 - 3 * self.loss ** 2) / (2 * self.loss * (self.loss ** 2 + beta ** 2))
@@ -174,39 +174,12 @@ class MulticoreFiber:
         beta = self.get_phase_matching_factor(*inputs[:3])
         return function(*inputs, beta, z)
 
-    def _sum_fwm_on_input_channels(self, ls_f, ls_p, function, z, *, include_generated):
-        """共用输入信道匹配；可选择收集并排序网格外的新频点。"""
-        out_f = ls_f.copy()
-        out_p = np.zeros((len(out_f), len(z)), dtype=float)
-        for inputs in self._iter_fwm_inputs(ls_f, ls_p):
-            frequency, power = self._evaluate_fwm(inputs, function, z)
-            matches = np.where(np.abs(out_f - frequency) < 1e8)[0]
-            # 保留两个旧接口的历史匹配行为；严格量子接口另行校验。
-            if len(matches) > 2:
-                raise RuntimeError('计算出的有两个匹配的值。')
-            if len(matches) == 1:
-                out_p[matches, :] += [power]
-            elif include_generated:
-                out_p = np.vstack((out_p, power))
-                out_f = np.append(out_f, frequency)
-        if include_generated:
-            order = np.argsort(out_f)
-            return out_f[order], out_p[order]
-        return out_f, out_p
-
-    def get_fwm_power_all(self, ls_f: np.array, ls_p: np.array, function, z: np.ndarray):
-        """返回输入及新生成频点的 FWM；按频率排序，功率形状为 (频点数, 距离数)。"""
-        return self._sum_fwm_on_input_channels(
-            ls_f, ls_p, function, z, include_generated=True)
-
-    def get_fwm_power_all2(self, ls_f: np.array, ls_p: np.array, function, z: np.ndarray):
-        """仅返回输入频点上的 FWM，保留输入顺序；匹配容差 100 MHz。"""
-        return self._sum_fwm_on_input_channels(
-            ls_f, ls_p, function, z, include_generated=False)
-
-    def get_fwm_power_all3(self, ls_f_class, ls_p_class, ls_f_quantum, function, z: np.ndarray):
+    def get_fwm_power(self, ls_f_class, ls_p_class, ls_f_quantum, function, z: np.ndarray):
         """返回指定频点上的 FWM；容差 100 kHz，沿用 float32 累加精度。
 
+        经典频率/功率为等长一维数组（Hz/W），目标频率为一维数组 Hz，z 为距离数组 m。
+        返回 (目标频率副本, 功率数组 W)，功率形状为 (目标频点数, 距离数)。
+        function 选择前/后向单项公式；无有效组合时返回零，一个生成频点匹配多个目标时报错。
         先匹配目标频点再计算功率，避免计算不会落入目标信道的组合。
         """
         out_f = ls_f_quantum.copy()
@@ -248,50 +221,50 @@ class MulticoreFiber:
 
         return fwm_permutations
 
-    # 拉曼散射计算相关
-    def get_raman_eta(self, f_pump, f_signal, list_eta_raman, index_center, f_diff):
-        """按泵浦与目标频率差查询拉曼谱系数，并做四次方频率校正。
-        
-        f_pump/f_signal/f_diff 为 Hz，index_center 为零频差下标。
-        频差除以谱采样间隔后取最近整数（Python round），不插值；越界直接报错。
-        返回系数与 z(m)、width(m) 配套使用，使 eta*z*width 为无量纲比例。
-        """
-        index = int(round((f_signal - f_pump) / f_diff))  # 取最近整数，恰在半整数时取偶数
-        if not 0 <= index_center + index < len(list_eta_raman):
-            raise ValueError("Frequency offset is outside the supplied Raman spectrum")
-        eta = list_eta_raman[index_center + index] * (f_signal / (self.FW + index * f_diff)) ** 4
-        return eta
+    # SpRS（自发拉曼散射）：谱系数、双向功率与目标信道汇总。
+    @lru_cache(maxsize=4096)
+    def get_raman_eta(self, f_pump, f_signal):
+        """返回自发拉曼波长谱系数 eta（m^-2），使 eta*P*L*width 的单位为 W。
 
-    def get_forward_raman_scatter(self, p: np.array, z: np.array, eta):
+        泵浦/目标频率为标量 Hz。复用 GNPy 默认谱及 Fiber.cr 的线性插值、
+        频率缩放、模场重叠面积；不沿用旧表的四次方校正。该谱是 SSMF 通用近似，
+        未经过本多芯光纤实验标定；GNPy 的增益谱本身并非自发拉曼系数。
+        面积公式是 GNPy effective_area_scaling 的代数化简，芯半径仍取其 4.2 um。
+        对频差 df=pump-signal，n=1/expm1(h*abs(df)/(k*T))；Stokes 用 n+1，
+        anti-Stokes 用 n。后者是本项目补充，GNPy 的自发噪声求解器只累加 Stokes。
+        两偏振谱密度为 2*h*f_signal*abs(cr)*热因子，再乘 f_signal^2/c，
+        从每 Hz 换算到每 m 波长；接收 width 保留在传播公式中，只乘一次。
+        这是中心频率谱密度乘滤波宽度的窄带近似，不对实际滤波通带积分，
+        也不使用 FWM 的 100 kHz 离散频率匹配容差。
+        零频差取谱首段斜率的解析极限；超出 42 THz 拒绝外推，无泵浦由汇总层跳过。
         """
-        计算前向拉曼散射功率
-        :param p: 输入功率
-        :param z: 传输距离
-        :param eta: 拉曼散射系数
-        :return: 输出功率
-        """
-        pout = eta * p * np.exp(-self.loss * z) * z * self.width
-        return pout
-
-    def get_forward_raman_scatter2(self, p: np.array, z: np.array, eta):
-        """同芯前向拉曼功率 W，分别使用经典/量子衰减；两衰减相等时此旧公式有零分母。"""
-        return p * np.exp(-self.loss_q * z) * (1 - np.exp(- (self.loss_c - self.loss_q) * z)) / (
-                self.loss_c - self.loss_q) * eta * self.width
-
-    def get_backward_raman_scatter(self, p: np.array, z: np.array, eta):
-        """
-        计算后向拉曼散射功率
-        :param p: 输入功率
-        :param z: 传输距离
-        :param eta: 拉曼散射系数
-        :return: 输出功率
-        """
-        pout = eta * p * (1 - np.exp(-2 * self.loss * z)) / (2 * self.loss) * self.width
-        return pout
-
-    def get_backward_raman_scatter2(self, p: np.array, z: np.array, eta):
-        """同芯后向拉曼功率 W，分别使用经典/量子衰减，z 为 m。"""
-        return p * (1 - np.exp(- (self.loss_c + self.loss_q) * z)) / (self.loss_c + self.loss_q) * eta * self.width
+        if not (math.isfinite(f_pump) and math.isfinite(f_signal)) or min(f_pump, f_signal) <= 0:
+            raise ValueError("Raman frequencies must be finite and positive")
+        offset = abs(f_pump - f_signal)
+        if offset > _RAMAN_OFFSET_HZ[-1]:
+            raise ValueError("Frequency offset exceeds the GNPy Raman spectrum (42 THz)")
+        core_area = math.pi * (4.2e-6) ** 2
+        def mode_area(frequency):
+            denominator = core_area / self.A_eff + math.log(frequency / self.reference_frequency)
+            if denominator <= 0:
+                raise ValueError("Frequency is outside the GNPy mode-area approximation")
+            return core_area / denominator
+        overlap = (mode_area(f_pump) + mode_area(f_signal)) / 2
+        # GNPy Fiber.cr 含反向能量转移的频率比，取幅值后两侧均对应较高光频。
+        scale = max(f_pump, f_signal) / (_RAMAN_REFERENCE_HZ * overlap)
+        h, k = 6.62607015e-34, 1.380649e-23
+        if offset == 0:
+            gain_thermal = (_RAMAN_GAMMA_M_PER_W[1] / _RAMAN_OFFSET_HZ[1]
+                            * scale * k * self.temperature / h)
+        else:
+            gamma = float(np.interp(offset, _RAMAN_OFFSET_HZ, _RAMAN_GAMMA_M_PER_W))
+            x = h * offset / (k * self.temperature)
+            # exp(-x) 避免低温时 exp(x) 上溢；expm1 保留近零频差精度。
+            thermal = 1 / (-math.expm1(-x))
+            if f_signal > f_pump:
+                thermal *= math.exp(-x)
+            gain_thermal = gamma * scale * thermal
+        return 2 * h * f_signal * gain_thermal * f_signal ** 2 / self.c
 
     def get_inter_forward_raman_scatter(self, p, z, eta):
         """芯间前向拉曼功率 W；eta 为谱系数，p 为经典功率 W，z 为距离 m。
@@ -309,264 +282,55 @@ class MulticoreFiber:
                 self.loss_q + self.loss_c + 2 * self.hmn)
                           - (np.exp(-(self.loss_q + self.loss_c) * z) - 1) / (self.loss_q + self.loss_c)) * self.width
 
-    def _raman_eta_lookup(self, list_eta_raman, index_center, f_diff):
-        """将光谱参数绑定到系数查询，汇总层只需传入泵浦和目标频率。"""
-        return partial(self.get_raman_eta, list_eta_raman=list_eta_raman,
-                       index_center=index_center, f_diff=f_diff)
+    def get_raman_power(self, ls_f: np.array, ls_p: np.array, ls_quantum: np.ndarray,
+                        function, z: np.ndarray):
+        """累加指定目标频点上的拉曼噪声，保留目标频点与泵浦累加顺序。
 
-    def _sum_raman_power(self, ls_f, ls_p, target_f, function, z, eta_for_pair,
-                         *, attenuations=None):
-        """共用拉曼汇总；保留逐泵浦累加顺序及各泵浦独立功率。
-
-        attenuations 为可选的 (泵浦衰减数组, 目标衰减数组)；
-        是否屏蔽同频系数由 eta_for_pair 决定。
+        ls_f/ls_p 为等长一维经典频率 Hz/功率 W，ls_quantum 为目标频率 Hz，z 为距离数组 m。
+        function 选择前/后向公式；返回 (目标频点数, 距离数) 功率数组 W，无泵浦时为零。
         """
-        z = np.array(z)
+        z = np.asarray(z)
         active = np.nonzero(ls_p)[0]
-        out_p = np.zeros((len(target_f), len(z)), dtype=float)
-        for target_index, signal in enumerate(target_f):
+        out_p = np.zeros((len(ls_quantum), len(z)), dtype=float)
+        for target_index, signal in enumerate(ls_quantum):
             for pump_index in active:
-                eta = eta_for_pair(ls_f[pump_index], signal)
-                extra_args = () if attenuations is None else (
-                    attenuations[0][pump_index], attenuations[1][target_index])
-                out_p[target_index] += function(ls_p[pump_index], z, eta, *extra_args)
+                eta = self.get_raman_eta(ls_f[pump_index], signal)
+                out_p[target_index] += function(ls_p[pump_index], z, eta)
         return out_p
 
-    def get_raman_power_all(self, ls_f: np.array, ls_p: np.array, function, z: np.ndarray,
-                            list_eta_raman, index_center, f_diff):
-        """计算输入频点上的拉曼噪声，返回 (频点数, 距离数) 功率数组。"""
-        return self._sum_raman_power(
-            ls_f, ls_p, ls_f, function, z,
-            self._raman_eta_lookup(list_eta_raman, index_center, f_diff))
+    # ICXT（线性芯间串扰）：沿用原公式，改用光纤共享参数。
+    # 原式以 km 计：alpha_km=1000*loss_c、h_km=1000*hmn、r_km=1000*loss_Rayleigh，
+    # L_km=distance/1000；代入后各项的 1000 抵消，下面直接使用 m 和 m^-1。
+    def get_forward_icxt_power(self, distance, power):
+        """前向串扰功率 W；distance 为标量 m，power 为源芯同频发射功率 W。"""
+        return (power * math.exp(-self.hmn * distance) * math.sinh(self.hmn * distance)
+                * math.exp(-self.loss_c * distance))
 
-    def get_raman_power_all2(self, ls_f: np.array, ls_p: np.array, ls_quantum: np.ndarray,
-                             function, z: np.ndarray, list_eta_raman, index_center, f_diff):
-        """计算指定目标频点上的拉曼噪声，保留目标频点顺序。"""
-        return self._sum_raman_power(
-            ls_f, ls_p, ls_quantum, function, z,
-            self._raman_eta_lookup(list_eta_raman, index_center, f_diff))
+    def get_backward_icxt_power(self, distance, power):
+        """反向串扰功率 W；距离 m，复用 loss_c、loss_Rayleigh、hmn（m^-1）。
 
-    def get_raman_power_all_O_quantum_C_classical(self, ls_f, ls_p, ls_quantum, function, z, eta_raman_O):
-        """O 波段量子信道、C 波段经典泵浦，使用传入的常量拉曼系数。"""
-        return self._sum_raman_power(
-            ls_f, ls_p, ls_quantum, function, z,
-            lambda pump, signal: eta_raman_O)
+        保留原 ICXT 公式；该式无额外瑞利俘获比例，不添加 FWM 的俘获因子。
+        """
+        loss = self.loss_c
+        return self.loss_Rayleigh * power * self.hmn * (
+            (1 - math.exp(-2 * loss * distance)) / loss
+            - 2 * distance * math.exp(-2 * loss * distance))
 
     def __str__(self):
         return 'Multicore, hmn={}/m'.format(self.hmn)
 
 
-class MulticoreFiber_Multi_Att(MulticoreFiber):
-    """保留的逐信道衰减计算接口，正式 main 仿真未调用。
-    
-    att/att_c/att_q 为 m^-1。注意后向芯间拉曼函数虽然接收 att_c/att_q，
-    实际仍使用实例固定 loss_c/loss_q；这条旧接口不具备完整的逐信道衰减能力。
-    芯内 FWM 则保留正弦振荡项，与基类的包络式近似不同。
-    """
-    def __init__(self, params):
-        super().__init__(params)
-
-    def get_four_wave_mixing(self, fi, fj, fk, pi, pj, pk, att, beta, z):
-        """以传入衰减 att（m^-1）计算含相位振荡的芯内 FWM；返回频率 Hz 和功率数组 W。"""
-        if np.abs(fi - fj) < 10 ** 6:
-            D = 3  # 如果相等，D=3
-        else:
-            D = 6  # 如果不相等，D=6
-
-        f_fwm = fi + fj - fk  # 四波混频频率
-        w_fwm = self.c / f_fwm  # 四波混频波长
-        # 四波混频转化效率
-        eta = att ** 2 / (att ** 2 + beta ** 2) \
-              * (1 + (4 * np.exp(-att * z) * np.sin(beta * z / 2) ** 2 / (1 - np.exp(-att * z)) ** 2))
-
-        eff_distance = (1 - np.exp(-att * z)) / att
-        gamma = (32 * np.pi ** 3 * self.e3) / (self.n ** 2 * w_fwm * self.c * self.A_eff)
-        p_fwm = eta * (D * gamma) ** 2. * eff_distance ** 2. * pi * pj * pk * np.exp(-att * z)
-
-        return f_fwm, p_fwm
-
-    # 需要输入衰减的拉曼散射
-    def get_forward_raman_scatter(self, p, z, eta, att_c, att_q):
-        """逐信道衰减的芯内前向拉曼功率 W；两衰减相等时使用其解析极限。"""
-        if att_c == att_q:
-            return p * np.exp(-att_c * z) * z * self.width * eta
-        return p * np.exp(-att_q * z) * ((1 - np.exp(-(att_c - att_q) * z)) / (att_c - att_q)) * self.width * eta
-
-    def get_backward_raman_scatter(self, p: np.array, z: np.array, eta, att_c, att_q):
-        """逐信道衰减的芯内后向拉曼功率 W；两衰减相等时使用同衰减公式。"""
-        if att_c == att_q:
-            return p * (1 - np.exp(-2 * att_c * z)) / (2 * att_c) * self.width * eta
-        return p * (1 - np.exp(-(att_c + att_q) * z)) / (att_c + att_q) * self.width * eta
-
-    def get_inter_forward_raman_scatter(self, p, z, eta, att_c, att_q):
-        """芯间前向拉曼功率 W；衰减相等时沿用微小扰动，未使用解析极限。"""
-        if att_c == att_q:
-            att_q = att_c * (1 + 1e-5)
-        return p * np.exp(-att_q * z) * (
-                (np.exp((att_q - att_c) * z) - 1) / (att_q - att_c)
-                - (np.exp((att_q - att_c - 2 * self.hmn) * z) - 1) / (
-                        att_q - att_c - 2 * self.hmn)) * self.width * eta
-
-    def get_inter_backward_raman_scatter(self, p, z, eta, att_c, att_q):
-        """旧接口限制：最终表达式使用实例 loss_c/loss_q，传入 att_c/att_q 不影响返回值。"""
-        if att_c == att_q:
-            att_q = att_c * (1 + 1e-5)
-        return eta * p * ((np.exp(-(self.loss_q + self.loss_c + 2 * self.hmn) * z) - 1) / (
-                self.loss_q + self.loss_c + 2 * self.hmn)
-                          - (np.exp(-(self.loss_q + self.loss_c) * z) - 1) / (self.loss_q + self.loss_c)) * self.width
-
-    def get_raman_power_all(self, ls_f: np.array, ls_p: np.array, ls_att: np.ndarray,
-                            function, z: list, out_ls_f, out_ls_att,
-                            list_eta_raman, index_center, f_diff):
-        """传递各泵浦/目标的衰减给 function，返回 [目标频点, 距离] 功率数组 W。
-        
-        同频差小于 1 kHz 时拉曼系数置零。具体函数是否采用传入衰减以该函数为准；
-        本类后向芯间接口仍使用实例固定衰减，不能据此方法名推断其已支持逐信道衰减。
-        """
-        lookup = self._raman_eta_lookup(list_eta_raman, index_center, f_diff)
-
-        def eta_for_pair(pump, signal):
-            eta = lookup(pump, signal)
-            return 0 if np.abs(pump - signal) < 1e3 else eta
-
-        return self._sum_raman_power(
-            ls_f, ls_p, out_ls_f, function, z, eta_for_pair,
-            attenuations=(ls_att, out_ls_att))
-
-
-@dataclass(frozen=True)
-class XTParameters:
-    """独立线性串扰接口参数，正式量子噪声汇总不使用它。
-    
-    loss_per_km/rayleigh_per_km 为 km^-1；gate_time 为 s；efficiency 为比例；
-    insertion_loss_db 为 dB；wavelength_m 为 m；planck_constant 为 J*s，
-    light_speed 为 m/s。串扰计数接口额外保留原公式的 1/2 因子。
-    """
-    loss_per_km: float
-    rayleigh_per_km: float
-    gate_time: float
-    efficiency: float
-    insertion_loss_db: float
-    wavelength_m: float
-    planck_constant: float
-    light_speed: float
-
-
-def forward_P_XT(hij, L, P0, params):
-    """前向串扰功率 W；hij 为 km^-1，L 为 m。"""
-    length_km = L / 1000
-    return (P0 * math.exp(-hij * length_km) * math.sinh(hij * length_km)
-            * math.exp(-params.loss_per_km * length_km))
-
-
-def backward_P_XT(hij, L, P0, params):
-    """反向串扰功率 W；沿用原公式与单位。"""
-    length_km = L / 1000
-    loss = params.loss_per_km
-    return params.rayleigh_per_km * P0 * hij * (
-        (1 - math.exp(-2 * loss * length_km)) / loss
-        - 2 * length_km * math.exp(-2 * loss * length_km))
-
-
-def _xt_counts(power, params):
-    """将线性串扰功率 W 转为每门探测计数，保留历史 1/2 因子；不含暗计数。"""
-    return (power / 2 * params.gate_time * params.efficiency
-            / params.planck_constant / params.light_speed * params.wavelength_m
-            * 10 ** (-0.1 * params.insertion_loss_db))
-
-
-def forward_SDM_XT(hij, L, P0, params):
-    """前向线性芯间串扰的每门计数；hij 为 km^-1、L 为 m、P0 为 W。"""
-    return _xt_counts(forward_P_XT(hij, L, P0, params), params)
-
-
-def backward_SDM_XT(hij, L, P0, params):
-    """反向线性芯间串扰的每门计数；hij 为 km^-1、L 为 m、P0 为 W。"""
-    return _xt_counts(backward_P_XT(hij, L, P0, params), params)
-
-
-def wave(num_of_channels, interval, *, center_frequency, min_frequency, max_frequency):
-    """以传入中心频率生成频率网格；超出传入边界则报错。"""
-    if type(num_of_channels) is not int or num_of_channels < 1:
-        raise ValueError("Channel count must be a positive integer")
-    if not np.isfinite(interval) or interval <= 0:
-        raise ValueError("Channel interval must be positive")
-    frequencies = center_frequency + (np.arange(num_of_channels) - num_of_channels // 2) * interval
-    if frequencies[0] < min_frequency or frequencies[-1] > max_frequency:
-        raise ValueError("Channels exceed supplied frequency range")
-    return frequencies
-
-
-@dataclass(frozen=True)
-class RamanSpectrum:
-    """已完成单位换算的拉曼系数表，不负责文件读取。"""
-    coefficients: tuple
-    index_center: int
-    frequency_step_hz: float
-
-    def __post_init__(self):
-        values = tuple(float(v) for v in self.coefficients)
-        if not values or not np.all(np.isfinite(values)) or min(values) < 0:
-            raise ValueError("Raman coefficients must be finite and nonnegative")
-        if type(self.index_center) is not int or not 0 <= self.index_center < len(values):
-            raise ValueError("Invalid Raman center index")
-        if not np.isfinite(self.frequency_step_hz) or self.frequency_step_hz <= 0:
-            raise ValueError("Raman frequency step must be positive")
-        object.__setattr__(self, "coefficients", values)
-
-
 @dataclass(frozen=True)
 class NoiseModel:
-    """组合最近邻、次近邻两组光纤参数及同一张拉曼谱；远芯不参与正式量子噪声汇总。"""
+    """组合最近邻、次近邻两组光纤；共用内置 GNPy 拉曼谱；远芯不参与正式量子噪声汇总。"""
     first_fiber: MulticoreFiber
     secondary_fiber: MulticoreFiber
-    raman: RamanSpectrum
 
-
-class ClassicalFWMScorer:
-    """求已占用泵浦在全部固定经典候选频点产生的芯内 FWM 总功率。
-
-    复用项目多芯光纤的三频组合及功率模型；模型/频率改变时应新建实例。
-    缓存只依赖频率（实例固定）、功率向量与距离，不依赖可变资源矩阵。
-    """
-    def __init__(self, frequencies, classical_indices, fiber):
-        self.indices = np.asarray(tuple(classical_indices), dtype=int)
-        self.frequencies = np.asarray(frequencies, dtype=float)[self.indices].copy()
-        self.fiber = fiber
-        self._cached = lru_cache(maxsize=8192)(self._calculate)
-
-    def _calculate(self, powers, distance):
-        if sum(p > 0 for p in powers) < 2 or distance == 0:
-            return 0.0
-        _, noise = self.fiber.get_fwm_power_all3(
-            self.frequencies, np.asarray(powers, dtype=float), self.frequencies,
-            self.fiber.get_four_wave_mixing, np.asarray([distance], dtype=float),
-        )
-        score = float(np.sum(noise, dtype=np.float64))
-        if not np.isfinite(score) or score < 0:
-            raise ValueError("Invalid classical FWM score")
-        return score
-
-    def __call__(self, powers, distance):
-        """输入包含量子及经典索引的全信道功率向量 W 和距离 m，返回所有经典候选上的 FWM 总功率 W。"""
-        selected = np.asarray(powers, dtype=float)[self.indices]
-        if not np.all(np.isfinite(selected)) or np.any(selected < 0):
-            raise ValueError("Classical powers must be finite and nonnegative")
-        if not np.isfinite(distance) or distance < 0:
-            raise ValueError("Link distance must be finite and nonnegative")
-        return self._cached(tuple(selected), float(distance))
-
-
-
-# 经典串扰参数沿用参考 XT.py；功率接口仅使用 loss_per_km 与 rayleigh_per_km。
-# 最近邻/次近邻耦合为 1e-6/1e-7 km^-1，独立于量子拉曼/FWM 的 hmn（m^-1）。
-# 功率接口仅使用前两个参数；其余值保留参考 XT.py 的探测参数约定。
-XT_PARAMS = XTParameters(0.2 / 4.343, 1e-3, 0.5e-9, 0.1, 8.0,
-                         1550e-9, 6.62e-34, 3e8)
 
 class ClassicalOSNRScorer:
-    """只读计算所选链路的参考经典 OSNR，不参与路由或分配。
+    """只读计算所选链路的经典 OSNR：参考公式配合本次共享光纤参数。
 
+    ICXT 使用 noise_model 两组光纤的 loss_c、loss_Rayleigh、hmn。
     参考业务入口先对占用信道的串扰求均值，再加固定噪声底 3.21e-9 W。
     单链路用实际长度、实际发射功率和一跳；两个经典方向的占用格共同平均。
     保留参考 calculate_noise_core 的判断：反向串扰仅在受扰芯的反向同频
@@ -575,7 +339,8 @@ class ClassicalOSNRScorer:
     接收信号沿用参考固定损耗 0.2 dB/km。statistics 中 *_sum_w 为占用格功率
     总和，noise_per_channel_w 除以占用格数；zero_noise_channels 仅指 XT 为零。
     """
-    def __init__(self):
+    def __init__(self, noise_model):
+        self.noise_model = noise_model
         self.statistics = {}
 
     def __call__(self, resources, powers, distances, first, secondary, link):
@@ -591,12 +356,13 @@ class ClassicalOSNRScorer:
         for i, j in ((a, b), (b, a)):
             for c, w in np.argwhere(resources[i, j] == 2):
                 noise = 0.0
-                for neighbors, coupling in ((first[c], 1e-6), (secondary[c], 1e-7)):
+                for neighbors, fiber in ((first[c], self.noise_model.first_fiber),
+                                         (secondary[c], self.noise_model.secondary_fiber)):
                     for neighbor in neighbors:
                         if powers[i, j, c, w] != 0:
-                            noise += forward_P_XT(coupling, length, float(powers[i, j, neighbor, w]), XT_PARAMS)
+                            noise += fiber.get_forward_icxt_power(length, float(powers[i, j, neighbor, w]))
                         if powers[j, i, c, w] != 0:
-                            noise += backward_P_XT(coupling, length, float(powers[j, i, neighbor, w]), XT_PARAMS)
+                            noise += fiber.get_backward_icxt_power(length, float(powers[j, i, neighbor, w]))
                 signal_sum += float(powers[i, j, c, w]) * 10 ** (-length * 0.2 * 1e-4)
                 xt_sum += noise
                 count += 1
@@ -613,8 +379,8 @@ class ClassicalOSNRScorer:
 def noise_power_to_counts(power, frequencies, detector):
     """将噪声功率(W)换算为每探测门噪声光子数（含探测效率，不含暗计数）。
 
-    power 与 frequencies 使用可广播的同形数组；探测器参数由调用方提供。
-    XT 的历史 SDM 接口保留其自身的门宽和常数。
+    power 与 frequencies 为可广播数组（W、Hz）；探测器 gate_time 为 s，
+    efficiency 为无量纲效率，insertion_loss_db 为 dB，由调用方提供。
     """
     return (np.asarray(power, dtype=float) * detector.gate_time * detector.efficiency
             * 10 ** (-0.1 * detector.insertion_loss_db)
@@ -622,10 +388,9 @@ def noise_power_to_counts(power, frequencies, detector):
 
 
 def _neighbor_noise_components(fiber, neighbors, forward_powers, backward_powers,
-                               frequencies, quantum_frequencies, z, raman):
+                               frequencies, quantum_frequencies, z):
     """汇总一组邻芯，依次返回前/后向拉曼、前/后向 FWM 功率。"""
     components = np.zeros((4, len(quantum_frequencies), len(z)), dtype=float)
-    coefficients = np.asarray(raman.coefficients)
     directions = (
         (forward_powers, fiber.get_inter_forward_raman_scatter,
          fiber.get_intercore_four_wave_mixing),
@@ -634,10 +399,9 @@ def _neighbor_noise_components(fiber, neighbors, forward_powers, backward_powers
     )
     for core in neighbors:
         for direction, (powers, raman_function, fwm_function) in enumerate(directions):
-            components[direction] += fiber.get_raman_power_all2(
-                frequencies, powers[core], quantum_frequencies, raman_function, z,
-                coefficients, raman.index_center, raman.frequency_step_hz)
-            components[direction + 2] += fiber.get_fwm_power_all3(
+            components[direction] += fiber.get_raman_power(
+                frequencies, powers[core], quantum_frequencies, raman_function, z)
+            components[direction + 2] += fiber.get_fwm_power(
                 frequencies, powers[core], quantum_frequencies, fwm_function, z)[1]
     return components
 
@@ -646,8 +410,9 @@ def calculate_noise_core(i, j, c, m_resourceMap, P_link, m_dis,
                          available_channel, first_neighbor, secondary_neighbor, noise_model):
     """返回指定链路/纤芯各量子信道的总噪声功率，一维数组，单位 W。
 
-    按资源状态选择量子信道（3）与已占用的经典泵浦（2），
-    仅统计邻芯/次邻芯双向拉曼和 FWM。
+    m_resourceMap/P_link 为 [源, 目的, 芯, 信道]，P_link 单位 W；m_dis 为距离矩阵 m，
+    available_channel 为信道频率 Hz。按状态选取量子信道（3）及已占用经典泵浦（2），
+    仅统计邻芯/次邻芯双向拉曼和 FWM。返回保持量子信道掩码顺序，无量子信道时返回空数组。
     """
     frequencies = np.asarray(available_channel)
     quantum_frequencies = frequencies[m_resourceMap[i, j, c] == 3]
@@ -657,10 +422,10 @@ def calculate_noise_core(i, j, c, m_resourceMap, P_link, m_dis,
 
     first = _neighbor_noise_components(
         noise_model.first_fiber, first_neighbor[c], active_forward, active_backward,
-        frequencies, quantum_frequencies, z, noise_model.raman)
+        frequencies, quantum_frequencies, z)
     secondary = _neighbor_noise_components(
         noise_model.secondary_fiber, secondary_neighbor[c], active_forward, active_backward,
-        frequencies, quantum_frequencies, z, noise_model.raman)
+        frequencies, quantum_frequencies, z)
 
     # 保留原先先拉曼、后 FWM 的浮点求和顺序，避免影响量子噪声/SKR 的浮点结果。
     noise_sum = (first[0] + first[1] + secondary[0] + secondary[1]

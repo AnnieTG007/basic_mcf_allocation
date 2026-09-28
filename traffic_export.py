@@ -1,29 +1,43 @@
 """把仿真状态和已算好的统计写成资源回放 JSON、Excel 工作簿与图表。
 
-由 traffic_scan 调用；不生成业务、不决定分配、不推进时间。输出路径由调用方给出。
-回放 kind=qkd_resource_timeline、schema_version=2，config.algorithm 含 QCNM 容差标签，
-base_algorithm 为分配算法名、qcnm_noise_rtol 为实际容差；config 还说明频率、芯分组、
-功率 dBm 和仿真时间单位。initial_occupancy 为初始状态，states 为每次资源
+由 traffic_scan 或 main.py 的离线重导出入口调用；不生成业务、不决定分配、不推进时间。输出路径由调用方给出。
+回放 kind=qkd_resource_timeline、schema_version=3，config.algorithm 含 QCNM 容差标签，
+不另存重复的算法名和容差字段；config 还说明频率、芯分组、
+功率 dBm 和 config.time_unit 指定的回放时间单位。initial_occupancy 为初始状态，states 为每次资源
 改变后的 {time, event, group_id, occupancy}，包含预热段。终点清空事件为
 horizon_release，带 group_ids，仅结束回放，不冒充自然离去、不改变仿真统计。
 
-本回放用于 --export-business 全网三芯实验，仅保留经过所选链路的已接入业务。
+本回放用于 --export-business 全网三芯实验，保留经过所选链路的已接入业务和全网阻塞到达。
 完整路由保留在 path，hops 和 occupancy 只含所选链路；全网阻塞统计在 metrics。
 business_groups 每条记录是一组到达：
 group_id、source/destination、direction、arrival_time、holding_time、scheduled_end_time、
-status（仅 accepted）、release_time、release_reason（natural/horizon）。
+status（accepted/blocked）、release_time、release_reason（natural/horizon）。
 source/destination/direction 描述端到端业务；回放传播方向必须读取 hops.direction，
 不能由端到端节点编号推断。allocation 含完整 path 和选中链路的 hops（link/direction/cores/physical_cores）、
 channel_index、frequency_hz 和 wavelength_nm。cores 为零起始仿真编号，physical_cores
 为物理芯号，不包含硬件端口。同组同方向三芯占用一致，两个方向可复用同一波长。
-负载单位为三芯业务组 Erlang，到达率按组/仿真时间计，功率为每芯每信道输入功率。
+负载单位为三芯业务组 Erlang，到达率单位见 arrival_rate_unit，功率为每芯每信道输入功率。
 
 occupancy 的维度为 [有向链路, 仿真芯, 经典信道]，链路顺序见 directed_links。
 -2 表示该方向不可用，-1 表示空闲，非负整数为占用业务 ID（0 也表示占用）。
 量子资源只写在 config 中；经典索引从 0 开始，长度由经典信道数决定，
 默认 10 个依次对应 C40 至 C36、C34、C32 至 C29（跳过 C33），
-不是 ITU 编号，也不是包含量子频率的仿真内部索引。channel_spacing_hz 只是
-基础网格间隔；跨量子频段及跳过 C33 均形成缺口，应读取实际 classical_frequencies_hz。
+不是 ITU 编号，也不是包含量子频率的仿真内部索引。跨量子频段及跳过 C33
+均形成缺口，应读取实际 classical_frequencies_hz。
+
+版本 3 沿用版本 2 的资源结构，增加阻塞记录、source_simulation、simulation_statistics
+和 config.time_scale/time_scale_unit；阻塞的 allocation/release_time/release_reason 为 null，
+states 中 blocked 事件保持占用不变。同刻事件必须按数组顺序回放，不重新排序。
+--experiment-duration-seconds 3600 将总时长100换为3600秒、预热10换为360秒，
+平均保持4换为144秒，到达率除以36，Erlang不变。config 为回放参数；
+metrics/samples 仍为原仿真统计，samples.time 不作为回放事件时间使用。
+--reexport-traffic 可直接读取已有 JSON 换算，不重新运行分配；旧版缺失的阻塞记录
+用 blocked_records_scope=not_recorded_in_source_v2 标记，不能由统计数值补造。
+实验端直接读取此 JSON 的 initial_occupancy、business_groups、states；horizon_release
+按数组原位置执行，scheduled_end_time 即使超过终点也不截断。无需 allocation plan。
+回放配置仅保留实际工况、单位、资源映射及终点策略；算法原理和统计解释写在代码
+注释与批次 manifest，不逐文件重复。metrics/samples 和对应 skr_model 保留用于
+核对原仿真结果。JSON 按字段和记录换行，芯号、频率及单芯占用等数值数组保持一行。
 
 扫描工作簿仅含 Summary；业务工作簿仅含 LoadSweep/PowerSweep。表格为普通黑白
 单元格，仅含条件、算法、SKR/OSNR/阻塞率/协同度及四项各自相对FF的比值。
@@ -31,6 +45,7 @@ occupancy 的维度为 [有向链路, 仿真芯, 经典信道]，链路顺序见
 为 kbit/s；它们表示密钥生成速率而非累计密钥比特。误差范围是种子
 均值间的样本标准差，单种子时不显示；空白表示未定义而非零。
 """
+from dataclasses import asdict
 from copy import deepcopy
 from hashlib import sha256
 import json
@@ -40,10 +55,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from noise_calculation import raman_model_config
 from skr_calculation import skr_model_config
 
 
-TRACE_SCHEMA_VERSION = 2
+TRACE_SCHEMA_VERSION = 3
 # 七芯专用映射：仿真 0..5 是外圈物理 2..7，仿真 6 是物理中心芯 1。
 CORE_TO_PHYSICAL = [2, 3, 4, 5, 6, 7, 1]
 
@@ -92,7 +108,12 @@ class TrafficRecorder:
             classical_frequencies_hz=[int(f) for f in sim.available_channel[sim.quantum_wave_num:]],
             channel_spacing_hz=int(sim.wave_interval),
             end_policy='release_at_horizon',
+            blocked_records_scope='all_network_arrivals',
+            event_order='states array order is authoritative, including equal timestamps',
             skr_model=skr_model_config(sim.bb84_params, sim.detector_params),
+            raman_model=raman_model_config(),
+            first_fiber=asdict(sim.noise_model.first_fiber),
+            secondary_fiber=asdict(sim.noise_model.secondary_fiber),
         )
         self.initial = deepcopy(self.occupancy)
         self.active = {}
@@ -100,16 +121,16 @@ class TrafficRecorder:
         self.business_groups = []
 
     def record(self, event, *, blocked=False):
-        """记录经过观测链路的已接入组及其真实资源变化；阻塞和其他链路业务不写入回放。
+        """记录观测链路已接入组和全网阻塞到达；阻塞不占用资源。
 
         业务组和 states 的 group_id 对应；离去沿用到达时的三芯成员。
         每次事件核对回放与真实资源/功率，避免在导出阶段凭空复制三芯占用。
         """
         bid = int(event.m_id)
         arrival = bool(event.m_eventType['Arrival'])
-        # 仅导出真实经过观测链路的已接入业务；全网到达/阻塞计数保留在 metrics。
+        # 阻塞不一定有工作路径，先保留记录；成功业务只导出观测链路部分。
         if arrival:
-            if blocked or not any((a, b) in self.link_index for a, b in zip(event.m_workPath, event.m_workPath[1:])):
+            if not blocked and not any((a, b) in self.link_index for a, b in zip(event.m_workPath, event.m_workPath[1:])):
                 return
         elif bid not in self.active:
             return
@@ -140,6 +161,9 @@ class TrafficRecorder:
             kind = 'arrival' if arrival else 'leave'
             self._update(service, kind)
             self.states.append(dict(time=float(event.m_time), event=kind,
+                                    group_id=bid, occupancy=deepcopy(self.occupancy)))
+        if blocked:
+            self.states.append(dict(time=float(event.m_time), event='blocked',
                                     group_id=bid, occupancy=deepcopy(self.occupancy)))
         self._check_state()
 
@@ -175,7 +199,7 @@ class TrafficRecorder:
         """返回回放；终点仍活跃组标记 horizon 释放，不修改仿真资源和统计。
 
         scheduled_end_time 保留自然结束计划，release_time 是回放中的释放时间。
-        时间为仿真单位，映射实际秒数由使用 JSON 的程序处理。
+        这里保留仿真单位；export_replay_timing 在序列化副本中换算实际秒数。
         """
         self._check_state()
         for bid in sorted(self.active):
@@ -192,30 +216,103 @@ class TrafficRecorder:
                     initial_occupancy=self.initial, states=self.states)
 
 
-def write_trace(path, data):
-    """以 UTF-8 写新 JSON，states 每个状态占一行，返回文件 SHA-256。
 
-    使用排他新建模式防止覆盖已有结果，不是文件系统只读保护。
-    拒绝 NaN/Infinity，以便其他程序读取；manifest 等字典也可使用此函数。
+def export_replay_timing(data, duration_seconds=None):
+    """返回版本 3 的独立副本；不调用分配器，不改输入记录、顺序或统计值。
+
+    config 是回放参数；source_simulation 保存原仿真时间参数、负载和来源版本。
+    time_scale 为输出时间单位/仿真单位；秒制时即 s/unit，未换算时为 1。
+    metrics 和 samples 原样保留，simulation_statistics.time_unit 为仿真单位。
+    精简 config 及统计说明，删除两个顶层重复哈希；其他顶层字段保持原样。
+    所有业务时间及 states.time 乘同比例系数，计划结束允许超过回放终点。
+    版本 2 曾丢弃阻塞记录，离线重导出无法恢复，必须显式标记缺失。
+    已为秒制的版本 3 可再次指定总时长，按当前时长换算，来源参数不覆盖。
+    duration_seconds=None 只升级格式和补充来源，保留现有时间单位。
     """
+    if data.get('kind') != 'qkd_resource_timeline' or data.get('schema_version') not in (2, 3):
+        raise ValueError('仅支持 qkd_resource_timeline 版本 2/3')
+    result = deepcopy(data)
+    config = result['config']
+    current_duration = config['duration']
+    if not math.isfinite(current_duration) or current_duration <= 0:
+        raise ValueError('原回放 duration 必须为有限正数')
+    if config['time_unit'] not in ('simulation_unit', 's'):
+        raise ValueError('不支持的回放时间单位')
+    if 'source_simulation' not in result:
+        if config['time_unit'] != 'simulation_unit':
+            raise ValueError('秒制回放缺少原仿真来源信息')
+        result['source_simulation'] = {key: deepcopy(config[key]) for key in (
+            'duration', 'warmup', 'mean_holding_time', 'arrival_rate',
+            'arrival_rate_unit', 'time_unit', 'offered_load_erlang')}
+        result['source_simulation']['schema_version'] = data['schema_version']
+    source = result['source_simulation']
+    if duration_seconds is not None:
+        if not math.isfinite(duration_seconds) or duration_seconds <= 0:
+            raise ValueError('实验总时长必须为有限正数（秒）')
+        factor = duration_seconds / current_duration
+        if not math.isfinite(factor) or factor <= 0:
+            raise ValueError('时间换算系数超出数值范围')
+        for key in ('warmup', 'mean_holding_time'):
+            config[key] *= factor
+        config['duration'] = float(duration_seconds)
+        config['arrival_rate'] /= factor
+        config.update(time_unit='s', arrival_rate_unit='three-core groups per second')
+        for service in result['business_groups']:
+            for key in ('arrival_time', 'holding_time', 'scheduled_end_time', 'release_time'):
+                if service[key] is not None:
+                    service[key] *= factor
+        for state in result['states']:
+            state['time'] *= factor
+    config['time_scale'] = config['duration'] / source['duration']
+    config['time_scale_unit'] = config['time_unit'] + ' per simulation_unit'
+    config.setdefault('blocked_records_scope', 'not_recorded_in_source_v2')
+    config['event_order'] = 'array_order'
+    # 只输出回放实际使用的配置；算法说明和全网构建参数留在批次索引。
+    replay_fields = (
+        'algorithm', 'seed', 'duration', 'warmup', 'time_unit',
+        'time_scale', 'time_scale_unit', 'mean_holding_time', 'arrival_rate',
+        'arrival_rate_unit', 'offered_load_erlang', 'power_dbm', 'power_reference',
+        'allocation_mode', 'directed_links', 'link_lengths_m', 'core_to_physical',
+        'forward_cores', 'backward_cores', 'quantum_cores', 'quantum_frequencies_hz',
+        'classical_frequencies_hz', 'end_policy', 'blocked_records_scope', 'event_order',
+        'skr_model', 'raman_model', 'first_fiber', 'secondary_fiber')
+    result['config'] = {key: config[key] for key in replay_fields if key in config}
+    if 'skr_model' in result['config']:
+        # 保留模型版本和实际数值参数，长篇公式解释已有源码说明。
+        result['config']['skr_model'] = {
+            key: value for key, value in config['skr_model'].items()
+            if not key.endswith('_definition') and key not in ('skr_reference', 'skr_security_scope')}
+    # 统计值保持原样；时间窗口已由 source_simulation 给出，无需重复。
+    result['simulation_statistics'] = dict(time_unit='simulation_unit')
+    result.pop('source_sha256', None)
+    result.pop('traffic_sha256', None)
+    result['schema_version'] = TRACE_SCHEMA_VERSION
+    return result
+
+
+def write_trace(path, data):
+    """以 UTF-8 写缩进 JSON，字段及记录换行，简单数组单行，嵌套数组逐层换行。
+
+    排他新建避免覆盖原文件；拒绝 NaN/Infinity。返回文件 SHA-256 供批次索引使用。
+    递归只改变排版，不改变字典和数组顺序；manifest 同样使用此格式。
+    """
+    def render(value, level=0):
+        indent = '  ' * level
+        child_indent = indent + '  '
+        if isinstance(value, dict) and value:
+            rows = [child_indent + json.dumps(key) + ': ' + render(item, level + 1)
+                    for key, item in value.items()]
+            return '{\n' + ',\n'.join(rows) + '\n' + indent + '}'
+        if isinstance(value, list) and any(isinstance(item, (dict, list)) for item in value):
+            rows = [child_indent + render(item, level + 1) for item in value]
+            return '[\n' + ',\n'.join(rows) + '\n' + indent + ']'
+        return json.dumps(value, ensure_ascii=False, allow_nan=False)
+
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    content = render(data) + '\n'
     with path.open('x', encoding='utf-8') as stream:
-        stream.write('{\n')
-        for index, (key, value) in enumerate(data.items()):
-            if index:
-                stream.write(',\n')
-            stream.write(json.dumps(key) + ':')
-            if key == 'states':
-                stream.write('[\n')
-                for i, row in enumerate(value):
-                    if i:
-                        stream.write(',\n')
-                    stream.write(json.dumps(row, ensure_ascii=False, separators=(',', ':'), allow_nan=False))
-                stream.write('\n]')
-            else:
-                stream.write(json.dumps(value, ensure_ascii=False, separators=(',', ':'), allow_nan=False))
-        stream.write('\n}\n')
+        stream.write(content)
     return sha256(path.read_bytes()).hexdigest()
 
 

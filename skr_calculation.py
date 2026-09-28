@@ -17,8 +17,7 @@ import math
 
 import numpy as np
 
-from noise_calculation import (calculate_noise_core, noise_power_to_counts,
-                               forward_P_XT, XT_PARAMS)
+from noise_calculation import calculate_noise_core, noise_power_to_counts
 
 
 @dataclass(frozen=True)
@@ -147,12 +146,13 @@ def BB84_SKR(distance, noise, params, detector, *, clip=True):
 
 
 def synergy_skr_bounds(distance, classical_core_count, launch_power, quantum_frequencies,
-                       params, detector):
+                       params, detector, fiber):
     """返回协同度的 SKR 标尺及串扰条件；距离 m、功率 W、频率 Hz、SKR bit/s。
 
     上限为零外加噪声 SKR，仍保留暗计数和有限样本惩罚。下限假设每个量子信道
-    受到 N_classical-1 个同功率正向串扰源，每源耦合系数固定为 1e-6 km^-1。
+    受到 N_classical-1 个同功率正向串扰源，每源使用最近邻 hmn，默认 1e-9 m^-1（即 1e-6 km^-1）。
     N_classical 由调用方按前后向经典芯集合的并集计数，不重复计算双向共享芯。
+    fiber 为本次最近邻光纤实例，复用其 ICXT 参数；单源功率也供经典协同度标尺使用。
     quantum_frequencies 按实际量子芯/信道逐项传入；逐项截零后求平均。
     串扰功率通过正式 noise_power_to_counts 转为探测后每门计数，不使用历史 SDM
     接口的额外 1/2 因子。这是假设归一化标尺，不向实际量子噪声模型加入串扰。
@@ -161,7 +161,8 @@ def synergy_skr_bounds(distance, classical_core_count, launch_power, quantum_fre
     source_count = classical_core_count - 1
     if source_count < 0 or len(quantum_frequencies) == 0:
         raise ValueError('SKR bounds require classical cores and quantum channels')
-    xt_power = source_count * forward_P_XT(1e-6, distance, launch_power, XT_PARAMS)
+    reference_xt_power = fiber.get_forward_icxt_power(distance, launch_power)
+    xt_power = source_count * reference_xt_power
     counts = noise_power_to_counts(xt_power, quantum_frequencies, detector)
     lower = float(np.mean([BB84_SKR(distance, float(noise), params, detector)[0]
                            for noise in counts]))
@@ -169,7 +170,8 @@ def synergy_skr_bounds(distance, classical_core_count, launch_power, quantum_fre
     return dict(synergy_skr_lower=lower, synergy_skr_upper=upper,
                 synergy_classical_core_count=classical_core_count,
                 synergy_xt_source_count=source_count, synergy_xt_power_w=xt_power,
-                synergy_reference_launch_power_w=launch_power)
+                synergy_reference_launch_power_w=launch_power,
+                synergy_reference_xt_power_w=reference_xt_power)
 
 
 def _validate_inputs(resource_map, powers, distances_m, frequencies_hz,
@@ -263,7 +265,6 @@ class QuantumLinkScorer:
     def _component(self, rank, backward, powers, quantum_indices, distance):
         """计算一个邻芯的拉曼与 FWM（四波混频）功率数组 W；rank=1/2 指最近/次近邻芯。"""
         fiber = self.model.first_fiber if rank == 1 else self.model.secondary_fiber
-        raman = self.model.raman
         frequencies = self.frequencies[list(quantum_indices)]
         z = np.asarray([distance])
         powers = np.asarray(powers)
@@ -271,10 +272,9 @@ class QuantumLinkScorer:
                     else fiber.get_inter_forward_raman_scatter)
         fwm_fn = (fiber.get_backward_intercore_four_wave_mixing if backward
                   else fiber.get_intercore_four_wave_mixing)
-        ram = fiber.get_raman_power_all2(
-            self.frequencies, powers, frequencies, raman_fn, z,
-            np.asarray(raman.coefficients), raman.index_center, raman.frequency_step_hz)
-        fwm = fiber.get_fwm_power_all3(
+        ram = fiber.get_raman_power(
+            self.frequencies, powers, frequencies, raman_fn, z)
+        fwm = fiber.get_fwm_power(
             self.frequencies, powers, frequencies, fwm_fn, z)[1]
         return ram[:, 0], fwm[:, 0]
 

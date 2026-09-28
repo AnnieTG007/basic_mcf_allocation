@@ -33,10 +33,11 @@ import numpy as np
 import pandas as pd
 
 from algorithm import ALGORITHMS
+from noise_calculation import raman_model_config
 from skr_calculation import skr_model_config, synergy_skr_bounds
 from synergistic_calculation import osnr_db, add_paired_synergy, METRIC_DEFINITIONS
 from traffic_export import (TrafficRecorder, export_business_summary,
-                            export_scan_results, write_trace)
+                            export_scan_results, export_replay_timing, write_trace)
 
 
 METRICS = ("skr", "raw_skr", "no_fwm_skr", "zero_noise_skr", "raman_w",
@@ -153,7 +154,7 @@ def measure_run(sim, warmup, event_recorder=None):
         row['observed_length_m'],
         len(set(sim.classical_forward_cores) | set(sim.classical_backward_cores)),
         sim.launch_power, np.asarray(sim.available_channel)[quantum_indices],
-        sim.bb84_params, sim.detector_params))
+        sim.bb84_params, sim.detector_params, sim.noise_model.first_fiber))
     row.update(offered=offered, accepted=accepted, blocked=blocked_count,
                blocking_rate=blocked_count / offered if offered else None,
                carried_load_erlang=carried_time / (sim.Ts - warmup),
@@ -204,13 +205,13 @@ def summarize(runs):
     return rows
 
 
-def source_hashes(base, topology, raman_file):
-    """为本次运行计算九个源码文件、所用拓扑和拉曼表的 SHA-256 摘要；不读取旧批次。"""
+def source_hashes(base, topology):
+    """为本次运行计算九个源码文件（含内置拉曼谱）和所用拓扑的 SHA-256 摘要；不读取旧批次。"""
     names = ('main.py', 'traffic_scan.py', 'traffic_export.py', 'algorithm.py',
              'noise_calculation.py', 'skr_calculation.py', 'core_layout.py', 'topology.py',
              'synergistic_calculation.py')
     paths = [base / name for name in names]
-    paths += [base / 'topologies' / f'{topology}.json', Path(raman_file)]
+    paths += [base / 'topologies' / f'{topology}.json']
     return {path.name: sha256(path.read_bytes()).hexdigest() for path in paths}
 
 
@@ -374,7 +375,7 @@ def run_load_scan(args, build_simulation, base):
                     uncertainty='Sample SD across independent seed means; blank for one seed; not a confidence interval',
                     blank_definition='Unavailable or undefined, not zero',
                     python=platform.python_version(),
-                    dependencies={name: version(name) for name in ('numpy', 'pandas', 'networkx', 'xlrd', 'openpyxl', 'matplotlib')})
+                    dependencies={name: version(name) for name in ('numpy', 'pandas', 'networkx', 'openpyxl', 'matplotlib')})
     metadata['metric_units'] = dict(skr='bit/s', raw_skr='bit/s', no_fwm_skr='bit/s',
         zero_noise_skr='bit/s', raman_w='W', fwm_w='W', offered_load_erlang='Erlang',
         carried_load_erlang='Erlang', rates_and_gains='fraction; Excel displays percent',
@@ -385,7 +386,7 @@ def run_load_scan(args, build_simulation, base):
     metadata['metric_units'].update(osnr_linear='power ratio', osnr_db='dB',
         classical_xt_w='W', classical_floor_w='W',
         synergy_vs_FF='dimensionless')
-    metadata['source_sha256'] = source_hashes(base, args.topology, args.raman_file)
+    metadata['source_sha256'] = source_hashes(base, args.topology)
     runs, samples, configurations = [], [], {}
     # 跨扫描点也比较输入业务摘要；距离改变路由时，仍只要求到达业务一致。
     traffic_hashes = {}
@@ -399,7 +400,7 @@ def run_load_scan(args, build_simulation, base):
                 for variant in variants:
                     algorithm = variant["algorithm"]
                     label = variant["label"]
-                    sim = build_simulation(base / 'topologies' / f'{args.topology}.json', args.raman_file,
+                    sim = build_simulation(base / 'topologies' / f'{args.topology}.json',
                         algorithm=algorithm, slots=args.slots, arrival_rate=load / args.holding_time,
                         holding_time=args.holding_time, k=args.k, seed=seed,
                         classical_channels=args.classical_channels, quantum_channels=args.quantum_channels,
@@ -416,7 +417,10 @@ def run_load_scan(args, build_simulation, base):
                             quantum_cores=sim.quantum_cores, observed_link=list(sim.observed_link),
                             length_scaling=sim.graph.graph['length_scaling'],
                             edges_m=[(int(a), int(b), float(sim.a_m[a,b])) for a,b in sim.graph.edges],
-                            detector=asdict(sim.detector_params), bb84=asdict(sim.bb84_params))
+                            detector=asdict(sim.detector_params), bb84=asdict(sim.bb84_params),
+                            raman_model=raman_model_config(),
+                            first_fiber=asdict(sim.noise_model.first_fiber),
+                            secondary_fiber=asdict(sim.noise_model.secondary_fiber))
 
                     common = dict(scenario=scenario, offered_load_erlang=load, algorithm=label,
                                   qcnm_noise_rtol=variant["qcnm_noise_rtol"],
@@ -524,7 +528,7 @@ def run_business_export(args, build_simulation, base):
     if output.exists() and any(output.iterdir()):
         raise ValueError('业务导出目录必须为空，避免覆盖实验依据')
     output.mkdir(parents=True, exist_ok=True)
-    hashes = source_hashes(base, args.topology, args.raman_file)
+    hashes = source_hashes(base, args.topology)
     experiments = [('load_scan', load, args.fixed_power) for load in loads]
     experiments += [('power_scan', fixed_load, power) for power in sorted(powers)]
     metadata = dict(loads_erlang=loads, powers_dbm=sorted(powers), fixed_load_erlang=fixed_load,
@@ -534,6 +538,9 @@ def run_business_export(args, build_simulation, base):
                     skr_units='Sweep sheets/figures: kbit/s; runs and trace JSON: bit/s. Not accumulated secret bits.',
                     uncertainty='Equal-weight seed means; sample SD across seeds, blank for one seed; not a confidence interval',
                     blank_definition='Unavailable or undefined, not zero',
+                    simulation_time_unit='simulation_unit',
+                    experiment_duration_seconds=args.experiment_duration_seconds,
+                    trace_schema_version=3,
                     timing='Full warmup and resource transitions retained; experiment duration maps linearly to simulation time',
                     power_reference='Per core per classical channel at fiber input, dBm', source_sha256=hashes,
                     allocation_mode='three_core_bound', traffic_unit='three_core_business_group',
@@ -562,7 +569,7 @@ def run_business_export(args, build_simulation, base):
             for variant in variants:
                 algorithm = variant["algorithm"]
                 label = variant["label"]
-                sim = build_simulation(base / 'topologies' / f'{args.topology}.json', args.raman_file,
+                sim = build_simulation(base / 'topologies' / f'{args.topology}.json',
                     algorithm=algorithm, slots=args.slots, arrival_rate=load / args.holding_time,
                     holding_time=args.holding_time, k=args.k, seed=seed,
                     classical_channels=args.classical_channels, quantum_channels=1,
@@ -581,19 +588,14 @@ def run_business_export(args, build_simulation, base):
                 references[key] = digest
                 data = recorder.finish(metrics, hashes)
                 data['samples'] = samples
-                data['config'].update(METRIC_DEFINITIONS,
-                    cca_experiment_policy=metadata['cca_experiment_policy'],
-                    synergy_baseline_layout=metadata['synergy_baseline_layout'],
-                    synergy_baseline_resource_policy=metadata['synergy_baseline_resource_policy'],
-                    qcnm_objective='Require N <= Nmin + rtol*abs(Nmin) for incremental Raman + FWM power at quantum receivers (W); then minimize occupied co-directional same-frequency first-neighbor count, noise, and channel index',
-                    qcnm_frequency_preference='Three-core same-frequency binding',
-                    algorithm=label, base_algorithm=algorithm, qcnm_noise_rtol=variant['qcnm_noise_rtol'])
+                data['config']['algorithm'] = label
                 runs.append(dict(group=group, algorithm=label, load_erlang=load,
                                  power_dbm=power, seed=seed, qcnm_noise_rtol=variant['qcnm_noise_rtol'], **metrics))
                 if not variant['export']:
                     continue
                 file_label = f'QCNM_rtol_{variant["qcnm_noise_rtol"]!r}' if algorithm == 'QCNM' else algorithm
                 filename = f'{group}/{file_label}_A{load:g}_P{power:g}_seed{seed}.json'
+                data = export_replay_timing(data, args.experiment_duration_seconds)
                 file_hash = write_trace(output / filename, data)
                 manifest['files'].append(dict(file=filename, sha256=file_hash, group=group,
                     algorithm=label, qcnm_noise_rtol=variant['qcnm_noise_rtol'], load_erlang=load, power_dbm=power, seed=seed,

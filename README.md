@@ -25,7 +25,10 @@ python main.py --scan-load --loads 10 20 30 --seeds 53 54 55 --slots 100 --warmu
 python main.py --scan-all --loads 10 20 30 --powers 0 5 10 --distances 1 5 10 20 --fixed-load 10 --launch-power-dbm 10 --seeds 53 54 55 --slots 100 --warmup 10
 
 # 按拓扑文件的实际距离分配三芯业务，导出双向回放及指标
-python main.py --export-business --classical-channels 10 --slots 100 --warmup 10 --seed 53
+python main.py --export-business --classical-channels 10 --slots 100 --warmup 10 --seed 53 --experiment-duration-seconds 3600
+
+# 已有业务 JSON 离线换算为一小时回放，不重新运行分配（输出文件不得已存在）
+python main.py --reexport-traffic results/previous/load_scan/FF_A10_P10.5_seed53.json --experiment-duration-seconds 3600 --output-dir results/replay_seconds
 
 # 自选比较算法和 QCNM 容忍系数；同样适用于 --export-business
 python main.py --scan-load --algorithm QCNM CCA first-fit --qcnm-noise-rtol 0 0.2 0.5 --slots 100 --warmup 10
@@ -36,6 +39,8 @@ python main.py --algorithm ALL --key-pulses 1e10 --key-gamma 5.3
 # 查看所有参数
 python main.py --help
 ```
+
+业务回放 JSON 版本 3 可由实验端直接读取，无需中间 allocation plan；指定实验秒数时包含同比例预热，省略则保留仿真时间单位。字段、事件顺序和旧版阻塞记录限制见 [traffic_export.py](traffic_export.py) 顶部说明。
 
 扫描及回放自动保存到 `results/` 下的新目录，包含 JSON、Excel 和图表；可用 `--output-dir` 指定新的空目录。普通单次运行只打印结果。
 
@@ -57,6 +62,6 @@ python main.py --help
 | [traffic_export.py](traffic_export.py) | 回放 JSON 格式、Excel 与图表输出 |
 | [topology.py](topology.py) / [core_layout.py](core_layout.py) | 拓扑 JSON、候选路径与纤芯编号 |
 
-运行需要 `topologies/` 和根目录的拉曼数据表 `Ramancrosssection25GHz（25GHz间隔）.xls`。`environment.yml` 是依赖安装清单，并非完整环境锁定文件。
+运行需要 `topologies/`。拉曼系数采用内置的 GNPy 3.0.1 默认谱及增益换算方式，不再读取 Excel，也无需安装 GNPy；来源、模型假设、单位和第三方授权直接标在 `noise_calculation.py` 的参数及公式注释中。`environment.yml` 是依赖安装清单，并非完整环境锁定文件。
 
 `results/` 用于保存运行生成的实验配置、原始数据和图表，程序会自动创建输出目录。修改项目前请阅读唯一规范 [PROJECT_GUIDE.md](PROJECT_GUIDE.md)。项目代码采用 MIT 许可证，以 GitHub 仓库已有的 `LICENSE` 为准；第三方材料仍须遵守其原授权。

@@ -3,11 +3,13 @@
 运行示例：python main.py --algorithm ALL --slots 5 --arrival-rate 2
 默认 topology7：边长取自拓扑文件的两节点链路，独立随机生成两个方向的业务。
 普通运行在终端打印结果；--scan-load/--scan-power/--scan-distance/--scan-all 和 --export-business 交给 traffic_scan
-组织实验。其余脚本是被导入的计算模块，直接运行不会启动仿真。
+组织实验。--reexport-traffic 直接调用 traffic_export 换算已有 JSON，不启动仿真。
+例如：python main.py --reexport-traffic input.json --experiment-duration-seconds 3600 --output-dir results/replay
+其余脚本是被导入的计算模块，直接运行不会启动仿真。
 
-输入为拓扑 JSON、拉曼系数 XLS 和命令行参数。命令行长度用 km、功率用
+输入为拓扑 JSON 和命令行参数；拉曼谱内置于 noise_calculation。命令行长度用 km、功率用
 每经典信道 dBm；内部统一转成 m、W，频率为 Hz，SKR（秘密密钥率）为 bit/s。
-时间是仿真单位：一个时隙长 1；到达事件可以发生在时隙内任意时刻。
+仿真内部时间是仿真单位：一个时隙长 1；到达事件可以发生在时隙内任意时刻。
 资源数组顺序为 [源节点, 目的节点, 纤芯, 信道]，0/1/2/3 分别表示
 不可用/空闲经典/占用经典/量子保留。信道索引不是 ITU 信道号。
 """
@@ -26,7 +28,7 @@ from core_layout import cores_code
 from skr_calculation import BB84Parameters, DetectorParameters, QuantumLinkScorer, skr_model_config
 from synergistic_calculation import add_paired_synergy
 from topology import load_topology, distance_matrix, k_shortest_paths, validate_graph
-from noise_calculation import (FiberParameters, MulticoreFiber, RamanSpectrum,
+from noise_calculation import (MulticoreFiber,
                              NoiseModel, ClassicalOSNRScorer)
 
 @dataclass(frozen=True)
@@ -162,7 +164,7 @@ class ClassicalService:
         self.rng = random.Random(params.seed)
 
         self.initialize()  # 初始化网络参数
-        self.classical_osnr_scorer = ClassicalOSNRScorer()
+        self.classical_osnr_scorer = ClassicalOSNRScorer(self.noise_model)
         self.quantum_scorer = QuantumLinkScorer(
             self.available_channel, self.first_neighbor, self.secondary_neighbor,
             self.noise_model, self.detector_params, self.bb84_params)
@@ -422,20 +424,7 @@ class ClassicalService:
         return row
 
 
-def load_raman_spectrum(path, *, index_center, frequency_step_hz, coefficient_scale):
-    """读取 XLS 第一张表的第二列数值，反转顺序并乘 coefficient_scale。
-    
-    文件列不能含文字表头；index_center 为反转后零频差所在下标，
-    frequency_step_hz 为光谱采样间隔。本项目分别传入 300、25e9 和 1e6。
-    系数换算沿用现有数据约定，原始表的来源及测量标定需由数据提供者确认。
-    """
-    import xlrd
-    with xlrd.open_workbook(str(path)) as workbook:
-        coefficients = np.asarray(workbook.sheets()[0].col_values(1), dtype=float)[::-1]
-    return RamanSpectrum(tuple(coefficients * coefficient_scale), index_center, frequency_step_hz)
-
-
-def build_simulation(topology_path, raman_path, *, algorithm="SCWA", slots=100,
+def build_simulation(topology_path, *, algorithm="SCWA", slots=100,
                      arrival_rate=7.5, holding_time=4, k=1, seed=53,
                      classical_channels=10, quantum_channels=1, launch_power=1e-3,
                      link_length_km=None, core_layout=None, skip_c33=True,
@@ -443,7 +432,7 @@ def build_simulation(topology_path, raman_path, *, algorithm="SCWA", slots=100,
                      observe_link_length_km=None, key_pulses=1e10, key_gamma=5.3):
     """读取输入文件并返回尚未运行的七芯仿真实例；这里集中放置默认物理参数。
     
-    topology_path/raman_path 是文件路径；arrival_rate 为每时间单位到达率，
+    topology_path 是拓扑文件路径；arrival_rate 为每时间单位到达率，
     holding_time 为平均保持时间，launch_power 为 W（与命令行 dBm 不同）。
     observe_link 指定观测边，默认选择拓扑中的最短边，同长度按节点编号字典序选择。
     默认直接使用拓扑文件各边的 length_km，不缩放；选择观测边不改变任何边长。
@@ -521,14 +510,14 @@ def build_simulation(topology_path, raman_path, *, algorithm="SCWA", slots=100,
     bb84 = BB84Parameters(loss_per_m=4.61e-5, dark_count=1e-6,
                            error_opt=0.01, sifting_efficiency=0.5, correct_error_eff=1.15,
                            pulse_count=key_pulses, fluctuation_gamma=key_gamma)
-    fiber_params = FiberParameters(
+    fiber = MulticoreFiber(
         loss=0.00004605111673958094,
         loss_c=0.00004605111673958094,
         loss_q=0.000046074142297950725,
         D_c=0.000017,
         D_s=56,
         A_eff=7e-11,
-        FW=193400000000000,
+        reference_frequency=193.4e12,
         c=299792458,
         e3=6.1796e-14,
         n=1.45,
@@ -536,13 +525,9 @@ def build_simulation(topology_path, raman_path, *, algorithm="SCWA", slots=100,
         recapture_factor_Rayleigh=0.0015,
         loss_Rayleigh=0.000032,
         width=1.2e-10,
+        temperature=300.0,  # K，室温近似；不是实验测量值。
     )
-    raman = load_raman_spectrum(raman_path, index_center=300,
-                                frequency_step_hz=25e9, coefficient_scale=1e6)
-    noise_model = NoiseModel(
-        MulticoreFiber(replace(fiber_params, hmn=1e-9)),
-        MulticoreFiber(replace(fiber_params, hmn=1e-10)), raman,
-    )
+    noise_model = NoiseModel(fiber, replace(fiber, hmn=1e-10))
     # 这里只取几何邻接关系；返回的耦合矩阵不参与噪声计算，噪声使用上面的 hmn。
     first_neighbors, secondary_neighbors, _ = cores_code(
         params.core_num, core_spacing=10, first_coupling=1e-6,
@@ -582,8 +567,6 @@ def main(argv=None):
     parser.add_argument('--observe-link-length-km', type=float, default=None,
                         help='显式覆盖观测边长度/km；默认直接使用拓扑文件中的实际边长')
     base = Path(__file__).resolve().parent
-    parser.add_argument("--raman-file", type=Path,
-                        default=base / "Ramancrosssection25GHz（25GHz间隔）.xls")
     parser.add_argument("--scan-load", action="store_true", help="扫描 A=lambda*E[H] 并导出 Excel、JSON、四指标对比 SVG")
     parser.add_argument("--scan-power", action="store_true", help="固定负载和距离，扫描每芯每信道功率")
     parser.add_argument("--scan-distance", action="store_true", help="固定负载和功率，扫描全网统一边长")
@@ -609,7 +592,32 @@ def main(argv=None):
                         help="有限样本SKR的总发射脉冲数，默认1e10；与仿真时隙数无关")
     parser.add_argument("--key-gamma", type=float, default=5.3,
                         help="诱骗态计数高斯波动标准差倍数，默认5.3；不是可组合安全参数")
+    parser.add_argument('--experiment-duration-seconds', type=float, default=None,
+                        help='业务回放总时长/秒（包含预热），只换算导出时间，不改变仿真')
+    parser.add_argument('--reexport-traffic', type=Path, default=None,
+                        help='离线重导出现有业务JSON，不运行仿真；配合实验秒数和output-dir')
     args = parser.parse_args(argv)
+    if args.experiment_duration_seconds is not None:
+        if not math.isfinite(args.experiment_duration_seconds) or args.experiment_duration_seconds <= 0:
+            parser.error('--experiment-duration-seconds 必须为有限正数')
+        if not (args.export_business or args.reexport_traffic):
+            parser.error('--experiment-duration-seconds 需要 --export-business 或 --reexport-traffic')
+    if args.reexport_traffic is not None:
+        if args.export_business or args.scan_load or args.scan_power or args.scan_distance or args.scan_all:
+            parser.error('--reexport-traffic 不能与仿真导出或扫描模式混用')
+        if args.experiment_duration_seconds is None or args.output_dir is None:
+            parser.error('--reexport-traffic 需要 --experiment-duration-seconds 和 --output-dir')
+        import json
+        from traffic_export import export_replay_timing, write_trace
+        try:
+            data = json.loads(args.reexport_traffic.read_text(encoding='utf-8'))
+            data = export_replay_timing(data, args.experiment_duration_seconds)
+            target = args.output_dir / args.reexport_traffic.name
+            write_trace(target, data)
+        except (ValueError, OSError, KeyError) as exc:
+            parser.error(str(exc))
+        print(f'离线回放导出完成：{target.resolve()}')
+        return data
     if not math.isfinite(args.key_pulses) or args.key_pulses < 1 or not args.key_pulses.is_integer():
         parser.error("--key-pulses 必须为有限正整数，可使用1e10形式")
     if not math.isfinite(args.key_gamma) or args.key_gamma < 0:
@@ -661,7 +669,7 @@ def main(argv=None):
         label = variant["label"]
         print(f"开始运行算法：{label}，拓扑：{args.topology}")
         sim = build_simulation(
-            base / "topologies" / f"{args.topology}.json", args.raman_file,
+            base / "topologies" / f"{args.topology}.json",
             algorithm=name, slots=args.slots, arrival_rate=args.arrival_rate,
             holding_time=args.holding_time, k=args.k, seed=args.seed,
             classical_channels=args.classical_channels, quantum_channels=args.quantum_channels,
