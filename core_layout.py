@@ -7,7 +7,7 @@ import numpy as np
 
 
 
-# FF 为首次适配，QCNM 为量子信道噪声抑制；其余沿用参考算法名，具体规则见 algorithm。
+# FF 为 first-fit（首次适配），QCNM 为 Quantum channel noise mitigation（量子信道噪声抑制）；算法缩写全称与规则见 algorithm。
 # SEVEN_CORE_LAYOUTS 固定各算法的量子芯及方向芯配置，例如 FF 的量子芯为 (6,)。
 # 表中元组顺序就是候选芯顺序，不根据芯数、列表首项或几何邻接推导算法分组。
 SEVEN_CORE_LAYOUTS = {

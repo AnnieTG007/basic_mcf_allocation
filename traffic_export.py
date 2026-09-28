@@ -1,6 +1,23 @@
 """由 main 或 traffic_scan 调用，将仿真状态及统计结果导出为回放 JSON、Excel 和图表。
-输出目录由调用方指定，本模块不生成业务、执行分配或重算统计。"""
-from dataclasses import asdict
+输出目录由调用方指定，本模块不生成业务、执行分配或重算统计。
+
+业务回放 JSON 只告诉实验端"哪些纤芯、某时刻占用哪些信道"，格式如下：
+
+    {
+      "forward_cores": [1, 3, 5],
+      "backward_cores": [0, 2, 4],
+      "channels_hz": [193.5e12, ...],
+      "duration_s": 3600,
+      "states": [
+        {"time_s": 0, "forward_channels": [], "backward_channels": []},
+        {"time_s": 10, "forward_channels": [4, 6, 9], "backward_channels": [1]}
+      ]
+    }
+
+约定：信道编号（channel）就是 channels_hz 中的下标，与仿真内部编号一致；前向指节点号由小到大。
+forward_cores/backward_cores 给出本次仿真实际使用的方向纤芯，供实验端与自身设置核对是否一致。
+某一时刻未出现在列表里的信道即该时刻不应有波长。states 按事件发生顺序排列，同时刻事件保持原顺序。
+"""
 from copy import deepcopy
 from hashlib import sha256
 import json
@@ -10,22 +27,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from noise_calculation import raman_model_config
-from skr_calculation import skr_model_config
-
-
-TRACE_SCHEMA_VERSION = 3
-# 七芯专用映射：仿真 0..5 是外圈物理 2..7，仿真 6 是物理中心芯 1。
-CORE_TO_PHYSICAL = [2, 3, 4, 5, 6, 7, 1]
-
 
 class TrafficRecorder:
     """观察已完成事件并记录所选链路的资源归属，生成三芯业务回放。"""
 
-    def __init__(self, sim, *, seed, warmup):
-        """接收三芯实例 sim，记录随机种子 seed（如 53）和预热时长 warmup（仿真时间单位）。"""
+    def __init__(self, sim):
+        """接收三芯实例 sim，按其观测链路的前后向芯建立占用记录。"""
         if not sim.bind_three:
-            raise ValueError('Business trace requires a three-core experiment')
+            raise ValueError('业务回放要求三芯实验实例')
         self.sim = sim
         a, b = sim.observed_link
         self.links = [(a, b), (b, a)]
@@ -35,46 +44,11 @@ class TrafficRecorder:
             [[-1 if sim.m_resourceMap[a, b, c, w] == 1 else -2
               for w in range(sim.quantum_wave_num, sim.WaveNumber)]
              for c in range(sim.core_num)] for a, b in self.links]
-        # 量子资源只存配置；经典索引从零开始，频段缺口应读取频率表，不能按索引连续推算。
-        self.config = dict(
-            allow_bidirectional=sim.allow_bidirectional,
-            algorithm=sim.algorithm,
-            seed=int(seed), duration=float(sim.Ts), warmup=float(warmup),
-            observed_link=list(sim.observed_link), allocation_scope='full_network',
-            network_node_count=len(sim.graph), network_edge_count=sim.graph.number_of_edges(),
-            network_length_scaling=deepcopy(sim.graph.graph['length_scaling']),
-            network_edges_m=[(int(a), int(b), float(sim.a_m[a, b])) for a, b in sim.graph.edges],
-            mean_holding_time=float(sim.m_rou1), arrival_rate=float(sim.lambda1),
-            offered_load_erlang=float(sim.lambda1 * sim.m_rou1),
-            power_dbm=float(10 * math.log10(sim.launch_power / 1e-3)),
-            power_reference='per_core_per_classical_channel_at_fiber_input',
-            allocation_mode='three_core_bound', traffic_unit='three_core_business_group',
-            load_unit='Erlang of three-core business groups',
-            arrival_rate_unit='three-core groups per simulation unit',
-            direction_definition='business direction uses end-to-end source/destination; each hop direction uses its link endpoints (forward u<v, backward u>v); replay must use hop direction',
-            time_unit='simulation_unit', direction_mode='bidirectional',
-            directed_links=[list(link) for link in self.links],
-            link_lengths_m=[float(sim.a_m[a, b]) for a, b in self.links],
-            core_to_physical=CORE_TO_PHYSICAL,
-            forward_cores=list(sim.classical_forward_cores),
-            backward_cores=list(sim.classical_backward_cores),
-            quantum_cores=list(sim.quantum_cores),
-            quantum_frequencies_hz=[int(f) for f in sim.available_channel[:sim.quantum_wave_num]],
-            classical_frequencies_hz=[int(f) for f in sim.available_channel[sim.quantum_wave_num:]],
-            channel_spacing_hz=int(sim.wave_interval),
-            end_policy='release_at_horizon',
-            blocked_records_scope='all_network_arrivals',
-            event_order='states array order is authoritative, including equal timestamps',
-            skr_model=skr_model_config(sim.bb84_params, sim.detector_params),
-            raman_model=raman_model_config(),
-            first_fiber=asdict(sim.noise_model.first_fiber),
-            secondary_fiber=asdict(sim.noise_model.secondary_fiber),
-        )
-        # 保存预热前初态，states 依事件原顺序记录，包含预热及同刻事件。
-        self.initial = deepcopy(self.occupancy)
+        # active 按业务编号保存已接入业务，供离去事件找回分配；trace 保存占用状态变化序列。
         self.active = {}
-        self.states = []
-        self.business_groups = []
+        self.trace = []
+        # 仿真从全空闲开始，显式记录起点，实验端无需假设初始占用状态。
+        self.trace.append(self._state(0.0, event_kind='initial'))
 
     def record(self, event, *, blocked=False):
         """记录所选链路的已接入组与全网阻塞到达，并核对回放是否与实际资源一致。"""
@@ -86,54 +60,55 @@ class TrafficRecorder:
                 return
         elif bid not in self.active:
             return
-        if arrival:
-            # 端到端方向只描述业务；实验回放须使用 allocation.hops 中逐跳方向。
-            service = dict(group_id=bid, source=int(event.m_sourceNode), destination=int(event.m_destNode),
-                direction='forward' if event.m_sourceNode < event.m_destNode else 'backward',
-                arrival_time=float(event.m_time), holding_time=float(event.m_holdTime),
-                scheduled_end_time=float(event.m_time + event.m_holdTime),
-                status='blocked' if blocked else 'accepted', allocation=None,
-                release_time=None, release_reason=None)
-            self.business_groups.append(service)
-            if not blocked:
-                path = [int(n) for n in event.m_workPath]
-                frequency = float(self.sim.available_channel[event.m_ocuppiedwave])
-                # path 保留完整路由，hops 仅含观测链路；物理芯号不代表硬件端口。
-                service['allocation'] = dict(path=path,
-                    hops=[dict(link=[a, b], direction='forward' if a < b else 'backward',
-                               cores=[int(c) for c in cores],
-                               physical_cores=[CORE_TO_PHYSICAL[c] for c in cores])
-                          for a, b, cores in zip(path, path[1:], event.m_ocuppiedcore)
-                          if (a, b) in self.link_index],
-                    channel_index=int(event.m_ocuppiedwave - self.sim.quantum_wave_num),
-                    frequency_hz=frequency, wavelength_nm=299792458 / frequency * 1e9)
-                self.active[bid] = service
-        else:
-            service = self.active.pop(bid)
-            service.update(release_time=float(event.m_time), release_reason='natural')
         if not blocked:
-            kind = 'arrival' if arrival else 'leave'
-            self._update(service, kind)
-            self.states.append(dict(time=float(event.m_time), event=kind,
-                                    group_id=bid, occupancy=deepcopy(self.occupancy)))
-        # 阻塞保留到达记录，但分配和释放字段为空，占用状态不变。
-        if blocked:
-            self.states.append(dict(time=float(event.m_time), event='blocked',
-                                    group_id=bid, occupancy=deepcopy(self.occupancy)))
+            if arrival:
+                # 到达先登记本次占用，离去事件按业务编号取回同一份芯组与信道。
+                self.active[bid] = dict(
+                    cores=[list(cores) for cores in event.m_ocuppiedcore], wave=int(event.m_ocuppiedwave))
+                self._update(bid, self.active[bid], 'arrival')
+            else:
+                self._update(bid, self.active[bid], 'leave')
+                self.active.pop(bid)
+        # 阻塞到达不改变占用，但要记录该时刻的状态，回放才能反映阻塞发生的时间点。
+        # 阻塞到达不改变占用，但仍要留下该时刻的占用状态；占用未变化时 _state 返回 None。
+        state = self._state(event.m_time, event_kind='blocked' if blocked else 'change')
+        if state is not None:
+            self.trace.append(state)
         self._check_state()
 
-    def _update(self, service, kind):
+    def _update(self, bid, service, kind):
         """回放三芯归属一起更新；到达须空闲，离去须属于同一组，否则报错。"""
-        allocation = service['allocation']
-        wave = allocation['channel_index']
-        for hop in allocation['hops']:
-            a, b = hop['link']
-            for core in hop['cores']:
-                row = self.occupancy[self.link_index[a, b]][core]
-                expected = -1 if kind == 'arrival' else service['group_id']
+        wave = service['wave'] - self.sim.quantum_wave_num
+        for cores in service['cores']:
+            for core in cores:
+                row = self.occupancy[self._direction(core)][core]
+                expected = -1 if kind == 'arrival' else bid
                 if row[wave] != expected:
-                    raise ValueError('Trace ownership disagrees with simulation lifecycle')
-                row[wave] = service['group_id'] if kind == 'arrival' else -1
+                    raise ValueError('回放归属与仿真生命周期不一致')
+                row[wave] = bid if kind == 'arrival' else -1
+
+    def _direction(self, core):
+        """返回该芯所属的观测链路下标：0 为前向（节点号小到大），1 为后向。"""
+        return 0 if core in self.sim.classical_forward_cores else 1
+
+    def _carried(self, link_index):
+        """返回该方向上当前被业务占用的信道编号列表，按编号升序；芯号不导出。
+
+        占用状态记录在 occupancy[有向链路][芯][信道]，同一方向的绑定芯必须同占用，
+        故任一成员芯给出同一信道列表。"""
+        return sorted({wave for core in self.occupancy[link_index]
+                       for wave, owner in enumerate(core) if owner >= 0})
+
+    def _state(self, time, *, event_kind):
+        """按当前占用生成一条回放状态；event_kind 仅用于说明该状态由哪类事件产生。
+
+        与上一条状态占用相同则返回 None，调用方据此跳过，回放只保留实际发生变化的时刻。"""
+        forward, backward = self._carried(0), self._carried(1)
+        if self.trace and (forward, backward) == (self.trace[-1]['forward_channels'],
+                                                  self.trace[-1]['backward_channels']):
+            return None
+        return dict(time_s=float(time), event=event_kind,
+                    forward_channels=forward, backward_channels=backward)
 
     def _check_state(self):
         """只读核查两方向的三芯一致性及回放占用；不会修复或改变仿真状态。"""
@@ -148,115 +123,52 @@ class TrafficRecorder:
                     or not np.all(recorded[cores] == recorded[cores[0]])
                     or not np.allclose(powers, np.where(resources == 2, sim.launch_power, 0),
                                        rtol=1e-6, atol=0)):
-                raise ValueError('Three-core trace disagrees with actual resource or per-core power')
+                raise ValueError('三芯回放与实际资源或每芯功率不一致')
 
-    def finish(self, metrics, source_hashes):
-        """生成含终点释放记录的回放字典，保留原仿真时间单位，不修改仿真资源或指标。"""
+    def build_trace(self):
+        """返回回放字典：方向纤芯、信道频率表、总时长及逐事件占用状态；不修改仿真资源或指标。
+
+        在业务全部离去前调用时，仍会被本方法补记终点状态：终点强制结束回放，
+        计划离去时间可超过终点，不能解释成自然离去。"""
         self._check_state()
-        # 终点强制释放只结束回放；计划离去时间可超过终点，不能解释成自然离去。
-        for bid in sorted(self.active):
-            self.active[bid].update(release_time=float(self.sim.Ts), release_reason='horizon')
-            self._update(self.active[bid], 'leave')
         if self.active:
-            self.states.append(dict(time=float(self.sim.Ts), event='horizon_release',
-                                    group_ids=sorted(self.active), occupancy=deepcopy(self.occupancy)))
-        self.active.clear()
-        return dict(schema_version=TRACE_SCHEMA_VERSION, kind='qkd_resource_timeline',
-                    config=self.config, source_sha256=source_hashes,
-                    traffic_sha256=metrics['traffic_sha256'], metrics=metrics,
-                    business_groups=self.business_groups,
-                    initial_occupancy=self.initial, states=self.states)
+            for bid, service in self.active.items():
+                self._update(bid, service, 'leave')
+            final = self._state(self.sim.Ts, event_kind='horizon_release')
+            if final is not None:
+                self.trace.append(final)
+            self.active.clear()
+        return dict(forward_cores=list(self.sim.classical_forward_cores),
+                    backward_cores=list(self.sim.classical_backward_cores),
+                    channels_hz=[float(f) for f in self.sim.available_channel],
+                    duration_s=float(self.sim.Ts),
+                    states=self.trace)
 
 
+def rescale_times(trace, duration_seconds):
+    """把回放按实验总时长缩放为秒制副本：时间乘系数，占用顺序与信道编号不变。
 
-def export_replay_timing(data, duration_seconds=None):
-    """将 data 回放升级为版本 3 的独立副本，按 duration_seconds 换算总时长。
-传入 None 时保留现有时间单位；输入记录、事件顺序和统计值不变。"""
-    if data.get('kind') != 'qkd_resource_timeline' or data.get('schema_version') not in (2, 3):
-        raise ValueError('仅支持 qkd_resource_timeline 版本 2/3')
-    result = deepcopy(data)
-    config = result['config']
-    current_duration = config['duration']
-    if not math.isfinite(current_duration) or current_duration <= 0:
-        raise ValueError('原回放 duration 必须为有限正数')
-    if config['time_unit'] not in ('simulation_unit', 's'):
-        raise ValueError('不支持的回放时间单位')
-    # 首次保存原仿真参数；已换为秒的回放再次缩放时仍保留同一来源。
-    if 'source_simulation' not in result:
-        if config['time_unit'] != 'simulation_unit':
-            raise ValueError('秒制回放缺少原仿真来源信息')
-        result['source_simulation'] = {key: deepcopy(config[key]) for key in (
-            'duration', 'warmup', 'mean_holding_time', 'arrival_rate',
-            'arrival_rate_unit', 'time_unit', 'offered_load_erlang')}
-        result['source_simulation']['schema_version'] = data['schema_version']
-    source = result['source_simulation']
-    if duration_seconds is not None:
-        if not math.isfinite(duration_seconds) or duration_seconds <= 0:
-            raise ValueError('实验总时长必须为有限正数（秒）')
-        # 如 100 个时间单位换为 3600 秒，时间乘 36，到达率除 36，Erlang 负载不变。
-        factor = duration_seconds / current_duration
-        if not math.isfinite(factor) or factor <= 0:
-            raise ValueError('时间换算系数超出数值范围')
-        for key in ('warmup', 'mean_holding_time'):
-            config[key] *= factor
-        config['duration'] = float(duration_seconds)
-        config['arrival_rate'] /= factor
-        config.update(time_unit='s', arrival_rate_unit='three-core groups per second')
-        # 只换算业务与回放事件时间；metrics/samples（含 samples.time）保持原仿真单位。
-        for service in result['business_groups']:
-            for key in ('arrival_time', 'holding_time', 'scheduled_end_time', 'release_time'):
-                if service[key] is not None:
-                    service[key] *= factor
-        for state in result['states']:
-            state['time'] *= factor
-    config['time_scale'] = config['duration'] / source['duration']
-    config['time_scale_unit'] = config['time_unit'] + ' per simulation_unit'
-    # 版本 2 缺失的阻塞记录无法由统计值补造，只标记来源缺口。
-    config.setdefault('blocked_records_scope', 'not_recorded_in_source_v2')
-    # 同刻事件及终点释放均按原数组顺序回放，不重新排序。
-    config['event_order'] = 'array_order'
-    # 只输出回放实际使用的配置；算法说明和全网构建参数留在批次索引。
-    replay_fields = (
-        'algorithm', 'seed', 'duration', 'warmup', 'time_unit', 'allow_bidirectional',
-        'time_scale', 'time_scale_unit', 'mean_holding_time', 'arrival_rate',
-        'arrival_rate_unit', 'offered_load_erlang', 'power_dbm', 'power_reference',
-        'allocation_mode', 'directed_links', 'link_lengths_m', 'core_to_physical',
-        'forward_cores', 'backward_cores', 'quantum_cores', 'quantum_frequencies_hz',
-        'classical_frequencies_hz', 'end_policy', 'blocked_records_scope', 'event_order',
-        'skr_model', 'raman_model', 'first_fiber', 'secondary_fiber')
-    result['config'] = {key: config[key] for key in replay_fields if key in config}
-    if 'skr_model' in result['config']:
-        # 保留模型版本和实际数值参数，长篇公式解释已有源码说明。
-        result['config']['skr_model'] = {
-            key: value for key, value in config['skr_model'].items()
-            if not key.endswith('_definition') and key not in ('skr_reference', 'skr_security_scope')}
-    # 统计值保持原样；时间窗口已由 source_simulation 给出，无需重复。
-    result['simulation_statistics'] = dict(time_unit='simulation_unit')
-    # 移除两个顶层重复摘要，其余顶层数据原样保留。
-    result.pop('source_sha256', None)
-    result.pop('traffic_sha256', None)
-    result['schema_version'] = TRACE_SCHEMA_VERSION
+    duration_seconds 例如 3600；总时长与各状态时间同步缩放，业务与占用关系不重排。"""
+    if not math.isfinite(duration_seconds) or duration_seconds <= 0:
+        raise ValueError('实验总时长必须为有限正数（秒）')
+    current = trace['duration_s']
+    if not math.isfinite(current) or current <= 0:
+        raise ValueError('原回放时长必须为有限正数')
+    factor = duration_seconds / current
+    if not math.isfinite(factor) or factor <= 0:
+        raise ValueError('时间换算系数超出数值范围')
+    result = deepcopy(trace)
+    result['duration_s'] = float(duration_seconds)
+    for state in result['states']:
+        state['time_s'] = state['time_s'] * factor
     return result
 
 
-def write_trace(path, data):
-    """以 UTF-8 排版写入 JSON 并返回 SHA-256 文件摘要；拒绝覆盖已有文件及非有限数值。"""
-    def render(value, level=0):
-        """递归排版 JSON：字段和嵌套记录换行，简单数组单行，保持原有顺序。"""
-        indent = '  ' * level
-        child_indent = indent + '  '
-        if isinstance(value, dict) and value:
-            rows = [child_indent + json.dumps(key) + ': ' + render(item, level + 1)
-                    for key, item in value.items()]
-            return '{\n' + ',\n'.join(rows) + '\n' + indent + '}'
-        if isinstance(value, list) and any(isinstance(item, (dict, list)) for item in value):
-            rows = [child_indent + render(item, level + 1) for item in value]
-            return '[\n' + ',\n'.join(rows) + '\n' + indent + ']'
-        return json.dumps(value, ensure_ascii=False, allow_nan=False)
-
+def write_trace(path, trace):
+    """以 UTF-8 写入回放 JSON 并返回 SHA-256 文件摘要；拒绝覆盖已有文件。"""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    content = render(data) + '\n'
+    content = json.dumps(trace, ensure_ascii=False, allow_nan=False) + '\n'
     with path.open('x', encoding='utf-8') as stream:
         stream.write(content)
     return sha256(path.read_bytes()).hexdigest()
@@ -274,16 +186,16 @@ def export_excel(path, tables):
     # 秘密密钥率（SKR）由 bit/s 转 kbit/s；光信噪比（OSNR）显示 dB，比值使用线性值。
     metrics = [('skr_mean', 'SKR (kbit/s)', .001, '0.000'),
                ('osnr_db_mean', 'OSNR (dB)', 1, '0.000'),
-               ('blocking_rate', 'Blocking rate', 1, '0.00%'),
-               ('synergy_vs_FF', 'Synergy', 1, '0.000000')]
+               ('blocking_rate', '阻塞率', 1, '0.00%'),
+               ('synergy_vs_FF', '协同度', 1, '0.000000')]
     ratio_keys = ('skr_mean', 'osnr_linear_mean', 'blocking_rate', 'synergy_vs_FF')
     for name, records, conditions in tables:
         if len(records) > 1_048_575:
-            raise ValueError(f'{name} exceeds Excel row limit')
+            raise ValueError(f'{name} 超过 Excel 行数上限')
         sheet = workbook.create_sheet(name)
-        headers = [label for _, label in conditions] + ['Algorithm']
+        headers = [label for _, label in conditions] + ['算法']
         headers += [label for _, label, _, _ in metrics]
-        headers += ['SKR / FF', 'OSNR / FF (linear)', 'Blocking / FF', 'Synergy / FF']
+        headers += ['SKR / FF', 'OSNR / FF（线性）', '阻塞率 / FF', '协同度 / FF']
         sheet.append(headers)
         baseline = {tuple(row[key] for key, _ in conditions): row for row in records
                     if row['algorithm'] == 'FF'}
@@ -302,7 +214,7 @@ def export_excel(path, tables):
         formats = ['General'] * len(conditions) + ['General']
         formats += [fmt for _, _, _, fmt in metrics] + ['0.000000'] * 4
         for column, (label, number_format) in enumerate(zip(headers, formats), 1):
-            sheet.column_dimensions[get_column_letter(column)].width = 26 if label == 'Algorithm' else 20
+            sheet.column_dimensions[get_column_letter(column)].width = 26 if label == '算法' else 20
             sheet.cell(1, column).alignment = Alignment(wrap_text=True, vertical='center')
             for cells in sheet.iter_cols(min_col=column, max_col=column, min_row=2):
                 for cell in cells:
@@ -414,15 +326,15 @@ def export_business_summary(output, runs, metadata, summary):
     from matplotlib.ticker import PercentFormatter
 
     specs = [
-        ('load_scan', 'LoadSweep', 'load_erlang', 'Three-core group traffic (Erlang)',
+        ('load_scan', '负载扫描', 'load_erlang', 'Three-core group traffic (Erlang)',
          f"Load sweep | {metadata['fixed_power_dbm']:g} dBm/core/channel"),
-        ('power_scan', 'PowerSweep', 'power_dbm', 'Power per core per channel (dBm)',
+        ('power_scan', '功率扫描', 'power_dbm', 'Power per core per channel (dBm)',
          f"Power sweep | {metadata['fixed_load_erlang']:g} Erlang of three-core groups")]
     algorithms = list(dict.fromkeys(r['algorithm'] for r in runs))
     colors = {name: plt.get_cmap('tab10')(i % 10) for i, name in enumerate(algorithms)}
     # 工作簿只保留两张汇总表，不嵌图；完整配置、种子与样本仍在 JSON 中。
     path = output / 'skr_summary.xlsx'
-    tables = [(sheet, summary[group], [('load_erlang', 'Load (Erlang)'), ('power_dbm', 'Power (dBm)')])
+    tables = [(sheet, summary[group], [('load_erlang', '负载 (Erlang)'), ('power_dbm', '功率 (dBm)')])
               for group, sheet, *_ in specs]
     export_excel(path, tables)
     artifacts = ['skr_summary.xlsx']
@@ -490,11 +402,9 @@ def export_business_summary(output, runs, metadata, summary):
     return artifacts
 
 
-def export_scan_results(output, data, save_samples=False):
-    """输出 traffic_scan.json、xlsx 和四指标对比 SVG；JSON 始终保留 samples，不重算统计。"""
-    (output / 'traffic_scan.json').write_text(
-        json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False), encoding='utf-8')
-    export_excel(output / 'traffic_scan.xlsx', [('Summary', data['summary'], [
-        ('offered_load_erlang', 'Load (Erlang)'), ('power_dbm', 'Power (dBm)'),
-        ('observed_length_m', 'Link length (m)')])])
+def export_scan_results(output, data):
+    """将扫描汇总导出为 traffic_scan.xlsx 和四指标对比 SVG，不重算统计。"""
+    export_excel(output / 'traffic_scan.xlsx', [('汇总', data['summary'], [
+        ('offered_load_erlang', '负载 (Erlang)'), ('power_dbm', '功率 (dBm)'),
+        ('observed_length_m', '链路长度 (m)')])])
     return plot_scan(output, data['summary'], data['config'].get('scan_axis', 'load'))

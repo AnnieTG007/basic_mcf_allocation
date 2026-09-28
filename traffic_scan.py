@@ -1,7 +1,7 @@
 """由 main.py 的扫描或业务导出入口调用，按给定参数与实例工厂编排实验。
 复用实例事件循环采样并汇总各随机种子，结果交给 traffic_export 写文件。"""
 from argparse import Namespace
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 from hashlib import sha256
 from importlib.metadata import version
@@ -13,11 +13,11 @@ import time
 import numpy as np
 import pandas as pd
 
-from noise_calculation import raman_model_config
-from skr_calculation import skr_model_config, synergy_skr_bounds
-from synergistic_calculation import osnr_db, add_paired_synergy, METRIC_DEFINITIONS
+from noise_calculation import OSNR_MODEL_VERSION, raman_model_config
+from skr_calculation import SKR_MODEL, calculate_quantum_metrics, synergy_skr_bounds
+from synergistic_calculation import osnr_db, add_paired_synergy
 from traffic_export import (TrafficRecorder, export_business_summary,
-                            export_scan_results, export_replay_timing, write_trace)
+                            export_scan_results, rescale_times, write_trace)
 
 
 METRICS = ("skr", "raw_skr", "no_fwm_skr", "zero_noise_skr", "raman_w",
@@ -26,6 +26,42 @@ METRICS = ("skr", "raw_skr", "no_fwm_skr", "zero_noise_skr", "raman_w",
            "classical_received_power_w", "classical_noise_power_w", "classical_noise_per_channel_w",
            "classical_xt_w", "classical_floor_w")
 GROUP = ["scenario", "offered_load_erlang", "algorithm"]
+
+
+def create_config(args, sim, *, algorithm_labels, warmup, seeds, loads, powers,
+                  fixed_load=None, fixed_power=None, variants):
+    """汇总本次运行的仿真参数与模型版本，供 config.json 及回放核对使用。
+
+    只记录实际生效的数值和模型标识，不写指标口径说明；口径与数据格式见各模块注释。
+    sim 用于读取拓扑、纤芯配置与光纤参数，扫描前尚无实例时传 None，此时省略这些字段。"""
+    config = dict(
+        topology=args.topology, slots=args.slots, warmup=warmup, seeds=seeds, knum=args.k,
+        holding_time=args.holding_time,
+        classical_channels=getattr(args, 'classical_channels', None),
+        quantum_channels=getattr(args, 'quantum_channels', None),
+        channel_spacing_hz=100e9, max_frequency_hz=193.5e12,
+        excluded_classical_frequencies_hz=[193.3e12] if not args.include_c33 else [],
+        allow_bidirectional=args.allow_bidirectional,
+        loads_erlang=loads, powers_dbm=powers,
+        fixed_load_erlang=fixed_load, fixed_power_dbm=fixed_power,
+        length_km=args.link_length_km,
+        key_pulses=args.key_pulses, key_gamma=args.key_gamma,
+        algorithms=algorithm_labels, comparison_variants=variants,
+        qcnm_noise_rtols=args.qcnm_noise_rtol,
+        skr_model=SKR_MODEL, osnr_model=OSNR_MODEL_VERSION,
+        raman_model=raman_model_config(),
+        python=platform.python_version(),
+        dependencies={name: version(name) for name in ('numpy', 'pandas', 'networkx', 'openpyxl', 'matplotlib')},
+        source_sha256=source_hashes(Path(__file__).resolve().parent, args.topology))
+    if sim is not None:
+        config.update(
+            observed_link=list(sim.observed_link),
+            observed_link_length_m=float(sim.a_m[sim.observed_link]),
+            forward_cores=list(sim.classical_forward_cores),
+            backward_cores=list(sim.classical_backward_cores),
+            quantum_cores=list(sim.quantum_cores),
+            first_fiber=asdict(sim.first_fiber), secondary_fiber=asdict(sim.secondary_fiber))
+    return config
 
 
 def measure_run(sim, warmup, event_recorder=None):
@@ -79,9 +115,12 @@ def measure_run(sim, warmup, event_recorder=None):
         totals = {key: 0.0 for key in METRICS[:7]}
         quantum_count = zero_count = 0
         for a, b in (sim.observed_link,):
-            metrics = sim.quantum_scorer.metrics(
+            metrics = calculate_quantum_metrics(
                 sim.m_resourceMap[a, b], sim.m_resourceMap[b, a],
-                sim.P_link[a, b], sim.P_link[b, a], sim.a_m[a, b])
+                sim.P_link[a, b], sim.P_link[b, a], sim.a_m[a, b],
+                sim.available_channel, sim.first_neighbor, sim.secondary_neighbor,
+                sim.first_fiber, sim.secondary_fiber,
+                sim.detector_params, sim.bb84_params)
             for key in totals:
                 totals[key] += metrics[key]
             quantum_count += metrics['quantum_channels']
@@ -93,10 +132,10 @@ def measure_run(sim, warmup, event_recorder=None):
                       occupied_channels=0,
                       zero_skr_fraction=zero_count / quantum_count)
         if not all(math.isfinite(value) for value in totals.values()):
-            raise ValueError("Non-finite simulation metric")
+            raise ValueError("仿真指标出现非有限值")
         # 光信噪比（OSNR）只测所选链路：平均接收信号 /（平均串扰 + 固定噪声底）。
-        totals['osnr_linear'] = sim.measure_classical_osnr()
-        classical = sim.classical_osnr_scorer.statistics
+        classical = sim.measure_classical_osnr()
+        totals['osnr_linear'] = classical['osnr_linear']
         totals['zero_xt_channels'] = classical['zero_noise_channels']
         # occupied_channels 只数观测链路资源格，active_services 则是全网业务数。
         totals['occupied_channels'] = classical['occupied_channels']
@@ -124,7 +163,7 @@ def measure_run(sim, warmup, event_recorder=None):
         row['observed_length_m'],
         len(set(sim.classical_forward_cores) | set(sim.classical_backward_cores)),
         sim.launch_power, np.asarray(sim.available_channel)[quantum_indices],
-        sim.bb84_params, sim.detector_params, sim.noise_model.first_fiber))
+        sim.bb84_params, sim.detector_params, sim.first_fiber))
     # 无到达时阻塞率未定义；承载量按窗口时长归一，利用率还需除以全网物理容量。
     row.update(offered=offered, accepted=accepted, blocked=blocked_count,
                blocking_rate=blocked_count / offered if offered else None,
@@ -280,39 +319,12 @@ def run_load_scan(args, build_simulation, base, *, variants):
     output.mkdir(parents=True, exist_ok=True)
     if any(output.glob('traffic_scan*')) or any(output.glob('traffic_diagnostics*')):
         raise ValueError('输出目录已有业务扫描结果，请指定新的 --output-dir')
-    metadata = dict(allow_bidirectional=args.allow_bidirectional, scan_axis=getattr(args, 'scan_axis', 'load'), topology=args.topology, loads_erlang=loads, seeds=seeds, slots=args.slots,
-                    warmup=warmup, holding_time=args.holding_time, algorithms=algorithms,
-                    scenarios=scenarios, k=args.k, skip_c33=not args.include_c33,
-                    classical_channels=args.classical_channels, quantum_channels=args.quantum_channels,
-                    core_layout='fixed seven-core algorithm layout',
-                    qcnm_noise_rtols=args.qcnm_noise_rtol,
-                    comparison_variants=variants,
-                    qcnm_objective='Require N <= Nmin + rtol*abs(Nmin) for incremental Raman + FWM power at quantum receivers (W); then minimize occupied co-directional same-frequency first-neighbor count, noise, and channel index',
-                    qcnm_frequency_preference='Disabled: replaced by co-directional same-frequency nearest-neighbor occupancy count',
-                    qcnm_neighbor_objective='Count occupied co-directional same-frequency classical channels on first neighbors; no secondary neighbors, opposite direction, power weights or XT calculation',
-                    scwa_rule='Reference seven-core groups: forward odd [4], even [3,5]; backward odd [6], even [0,2]. Odd/even lists use original channel indices and actual channel count. Count every state != 1 in the original parity cells; swap when count >= nominal capacity - 10. Search original indices in ascending order, with no fallback',
-                    scwa_version='reference_seven_core_fixed_reserve_10_no_fallback_v2',
-                    allocation_mode='single_core_per_hop', three_core_binding=False,
-                    load_definition='A = arrival_rate * holding_time; network-wide offered traffic',
-                    observation_window=f'[{warmup}, {args.slots}) time units',
-                    time_unit='One simulation time unit per slot; arrival_rate is per time unit',
-                    carried_load_definition='Exact integral of active accepted services / observation duration',
-                    gain_definition='Ratio of equally weighted seed mean SKR minus one; blank if baseline absent or zero',
-                    uncertainty='Sample SD across independent seed means; blank for one seed; not a confidence interval',
-                    blank_definition='Unavailable or undefined, not zero',
-                    python=platform.python_version(),
-                    dependencies={name: version(name) for name in ('numpy', 'pandas', 'networkx', 'openpyxl', 'matplotlib')})
-    metadata['metric_units'] = dict(skr='bit/s', raw_skr='bit/s', no_fwm_skr='bit/s',
-        zero_noise_skr='bit/s', raman_w='W', fwm_w='W', offered_load_erlang='Erlang',
-        carried_load_erlang='Erlang', rates_and_gains='fraction; Excel displays percent',
-        noise_counts='counts per gate, summed over quantum receivers')
-    metadata.update(METRIC_DEFINITIONS, observe_link=args.observe_link or 'shortest topology edge; node-order tie break',
-                    observe_link_length_km=args.observe_link_length_km,
-                    observed_length_policy='Default: use original topology edge lengths without scaling; explicit uniform or observed-edge overrides are separate experiments; actual observed length stored in runs')
-    metadata['metric_units'].update(osnr_linear='power ratio', osnr_db='dB',
-        classical_xt_w='W', classical_floor_w='W',
-        synergy_vs_FF='dimensionless')
-    metadata['source_sha256'] = source_hashes(base, args.topology)
+    # config 只记录本次扫描实际生效的数值参数，口径说明留在代码注释里。
+    config = create_config(args, sim=None, algorithm_labels=algorithms, warmup=warmup,
+                           seeds=seeds, loads=loads, powers=[power for _, power in scenarios],
+                           fixed_load=args.fixed_load, fixed_power=None, variants=variants)
+    metadata = dict(config, scan_axis=getattr(args, 'scan_axis', 'load'), scenarios=scenarios,
+                    observed_length_policy='topology lengths unless link_length_km is set')
     # variants 已由主控展开容差并补 FF 内部基准；这里只运行指定组合，按 export 标记筛选输出。
     runs, samples, configurations = [], [], {}
     # 跨扫描点也比较输入业务摘要；距离改变路由时，仍只要求到达业务一致。
@@ -337,31 +349,32 @@ def run_load_scan(args, build_simulation, base, *, variants):
                         allow_bidirectional=args.allow_bidirectional, qcnm_noise_rtol=variant["qcnm_noise_rtol"] or 0.0, observe_link=args.observe_link,
                         observe_link_length_km=args.observe_link_length_km,
                         key_pulses=args.key_pulses, key_gamma=args.key_gamma)
-                    metadata.setdefault('skr_model', skr_model_config(sim.bb84_params, sim.detector_params))
+                    # 逐算法只记录会随算法变化的物理配置，公共模型参数见顶层 metadata。
                     config_key = f'{scenario_index}:{label}'
                     if config_key not in configurations:
-                        configurations[config_key] = dict(qcnm_noise_rtol=variant["qcnm_noise_rtol"], frequencies_hz=sim.available_channel,
-                            forward_cores=sim.classical_forward_cores, backward_cores=sim.classical_backward_cores,
-                            quantum_cores=sim.quantum_cores, observed_link=list(sim.observed_link),
+                        configurations[config_key] = dict(qcnm_noise_rtol=variant["qcnm_noise_rtol"], frequencies_hz=list(sim.available_channel),
+                            forward_cores=list(sim.classical_forward_cores), backward_cores=list(sim.classical_backward_cores),
+                            quantum_cores=list(sim.quantum_cores), observed_link=list(sim.observed_link),
                             length_scaling=sim.graph.graph['length_scaling'],
-                            edges_m=[(int(a), int(b), float(sim.a_m[a,b])) for a,b in sim.graph.edges],
-                            detector=asdict(sim.detector_params), bb84=asdict(sim.bb84_params),
-                            raman_model=raman_model_config(),
-                            first_fiber=asdict(sim.noise_model.first_fiber),
-                            secondary_fiber=asdict(sim.noise_model.secondary_fiber))
+                            edges_m=[(int(a), int(b), float(sim.a_m[a,b])) for a,b in sim.graph.edges])
 
                     common = dict(scenario=scenario, offered_load_erlang=load, algorithm=label,
                                   qcnm_noise_rtol=variant["qcnm_noise_rtol"],
                                   seed=seed, length_km=length, power_dbm=power,
                                   arrival_rate=load / args.holding_time)
                     row, trace = measure_run(sim, warmup)
+                    # BB84、探测与光纤参数不随算法变化，取首次构建的实例记录一份。
+                    metadata.setdefault('bb84', asdict(sim.bb84_params))
+                    metadata.setdefault('detector', asdict(sim.detector_params))
+                    metadata.setdefault('first_fiber', asdict(sim.first_fiber))
+                    metadata.setdefault('secondary_fiber', asdict(sim.secondary_fiber))
                     # 校验输入到达序列相同，不意味着不同算法接入了相同业务。
                     if reference_hash is not None and row['traffic_sha256'] != reference_hash:
-                        raise ValueError('Paired algorithms received different traffic traces')
+                        raise ValueError('配对算法收到的业务到达序列不一致')
                     reference_hash = row['traffic_sha256']
                     paired_hash = traffic_hashes.setdefault((load, seed), reference_hash)
                     if paired_hash != reference_hash:
-                        raise ValueError('Scan points received different traffic traces')
+                        raise ValueError('不同扫描点收到的业务到达序列不一致')
                     runs.append({**common, **row})
                     samples.extend({**common, **sample} for sample in trace)
                     block = 'n/a' if row['blocking_rate'] is None else f"{row['blocking_rate']:.2%}"
@@ -373,10 +386,10 @@ def run_load_scan(args, build_simulation, base, *, variants):
     summary = select_comparison_rows(summary, variants, ('scenario', 'offered_load_erlang'))
     runs = select_comparison_rows(runs, variants, ('scenario', 'offered_load_erlang', 'seed'))
     samples = [row for row in samples if row['algorithm'] in algorithms]
-    # JSON 始终保留逐时隙样本；save_samples 仅兼容旧参数，Excel 仅输出汇总简表。
+    # 普通扫描仅写 Excel 和图；配置、单次指标与样本保留在返回值中。
     data = dict(config=metadata, summary=summary, runs=runs, samples=samples)
-    figures = export_scan_results(output, data, args.save_samples)
-    print(f"扫描完成：{output}\nExcel: traffic_scan.xlsx\nJSON: traffic_scan.json\n图: {', '.join(figures)}")
+    figures = export_scan_results(output, data)
+    print(f"扫描完成：{output}\nExcel: traffic_scan.xlsx\n图: {', '.join(figures)}")
     return data
 
 
@@ -412,7 +425,7 @@ def run_business_export(args, build_simulation, base, *, variants):
     import openpyxl  # noqa: F401
     import matplotlib  # noqa: F401
 
-    if args.scan_load or args.scan_scenarios or args.save_samples:
+    if args.scan_load or args.scan_scenarios:
         raise ValueError('--export-business 不与统计扫描模式同时使用')
     if args.classical_channels <= 0:
         raise ValueError('实验经典信道数必须为正整数')
@@ -441,39 +454,9 @@ def run_business_export(args, build_simulation, base, *, variants):
     # 负载组与功率组独立扫描，交叉工况在两组各保留一份。
     experiments = [('load_scan', load, args.fixed_power) for load in loads]
     experiments += [('power_scan', fixed_load, power) for power in sorted(powers)]
-    metadata = dict(allow_bidirectional=args.allow_bidirectional, loads_erlang=loads, powers_dbm=sorted(powers), fixed_load_erlang=fixed_load,
-                    classical_channels=args.classical_channels, quantum_channels=1,
-                    fixed_power_dbm=args.fixed_power, seeds=seeds, slots=args.slots, warmup=warmup,
-                    holding_time=args.holding_time, topology=args.topology, length_km=args.link_length_km, algorithms=algorithms,
-                    skr_units='Sweep sheets/figures: kbit/s; runs and trace JSON: bit/s. Not accumulated secret bits.',
-                    uncertainty='Equal-weight seed means; sample SD across seeds, blank for one seed; not a confidence interval',
-                    blank_definition='Unavailable or undefined, not zero',
-                    simulation_time_unit='simulation_unit',
-                    experiment_duration_seconds=args.experiment_duration_seconds,
-                    trace_schema_version=3,
-                    timing='Full warmup and resource transitions retained; experiment duration maps linearly to simulation time',
-                    power_reference='Per core per classical channel at fiber input, dBm', source_sha256=hashes,
-                    allocation_mode='three_core_bound', traffic_unit='three_core_business_group',
-                    qcnm_objective='Require N <= Nmin + rtol*abs(Nmin) for incremental Raman + FWM power at quantum receivers (W); then minimize occupied co-directional same-frequency first-neighbor count, noise, and channel index',
-                    qcnm_frequency_preference='All three cores must use the same frequency; fixed directional groups can yield identical results across tolerances',
-                    qcnm_noise_rtols=args.qcnm_noise_rtol, comparison_variants=variants,
-                    load_definition='Erlang of three-core business groups; A = group arrival rate * mean holding time',
-                    default_load_scaling='Load scan defaults to 5,10,15,20,25,30,35,40 Erlang three-core groups; power scan defaults to 10; explicit group loads are not divided by three or reduced to meet a blocking target',
-                    carried_load_definition='Integral of active accepted groups / observation duration',
-                    resource_definition='capacity/utilization are network-wide; occupied_channels counts only the selected link; all count physical core-channel cells')
-    # 5% 仅是人为实验目标，不参与接入决策，也不保证任何给定工况达到该目标。
-    metadata.update(blocking_rate_limit=.05,
-                    blocking_definition='Blocked three-core group arrivals / offered group arrivals in [warmup, slots); not packet loss or BER',
-                    blocking_limit_definition='User-selected experiment target, strictly below 5%; not an enforced admission rule or universal standard')
-    metadata.update(METRIC_DEFINITIONS, observe_link=args.observe_link or 'shortest topology edge; node-order tie break',
-                    observe_link_length_km=args.observe_link_length_km,
-                    observed_length_policy='Default: use original topology edge lengths without scaling; explicit uniform or observed-edge overrides are separate experiments; actual observed length stored in runs',
-                    synergy_baseline_layout=dict(quantum=[6], forward=[0, 1, 2], backward=[3, 4, 5]),
-                    synergy_baseline_resource_policy='Three-core binding; disjoint directional groups; ascending actual frequency')
-    metadata['cca_experiment_policy'] = 'Three-core adaptation: quantum core 0; forward [1,2,3]; backward [4,5,6]; ascending actual frequency; disjoint directions, not reference six-core shared CCA'
-    manifest = dict(schema_version=4, kind='qkd_business_experiments',
-                    description='Network allocation; selected-link replay and metrics; full warmup retained',
-                    config=metadata, files=[])
+    # manifest 汇总本批次文件、单次指标与跨种子统计；回放格式与文件命名见 traffic_export 模块说明。
+    manifest = dict(description='Three-core experiment batch: per-run channel replay, config and summary',
+                    config='config.json', files=[], artifacts=[])
     # 三芯导出仅选择 CCA/QCNM；主控补跑的 FF 仅用于配对基准，不导出其回放或曲线。
     references, runs = {}, []
     for group, load, power in experiments:
@@ -490,38 +473,44 @@ def run_business_export(args, build_simulation, base, *, variants):
                     allow_bidirectional=args.allow_bidirectional, qcnm_noise_rtol=variant["qcnm_noise_rtol"] or 0.0, bind_three=True, observe_link=args.observe_link,
                         observe_link_length_km=args.observe_link_length_km,
                         key_pulses=args.key_pulses, key_gamma=args.key_gamma)
-                metadata.setdefault('skr_model', skr_model_config(sim.bb84_params, sim.detector_params))
-                recorder = TrafficRecorder(sim, seed=seed, warmup=warmup)
+                recorder = TrafficRecorder(sim)
                 metrics, samples = measure_run(sim, warmup, event_recorder=recorder)
                 key = (load, seed)
                 digest = metrics['traffic_sha256']
                 if key in references and references[key] != digest:
                     raise ValueError('不同算法或功率的业务到达序列不一致')
                 references[key] = digest
-                data = recorder.finish(metrics, hashes)
-                data['samples'] = samples
-                data['config']['algorithm'] = label
                 runs.append(dict(group=group, algorithm=label, load_erlang=load,
                                  power_dbm=power, seed=seed, qcnm_noise_rtol=variant['qcnm_noise_rtol'], **metrics))
                 if not variant['export']:
                     continue
-                file_label = f'QCNM_rtol_{variant["qcnm_noise_rtol"]!r}' if algorithm == 'QCNM' else algorithm
+                trace = recorder.build_trace()
+                if args.experiment_duration_seconds is not None:
+                    trace = rescale_times(trace, args.experiment_duration_seconds)
+                file_label = f'qcnm_rtol_{variant["qcnm_noise_rtol"]!r}' if algorithm == 'QCNM' else algorithm
                 filename = f'{group}/{file_label}_A{load:g}_P{power:g}_seed{seed}.json'
-                data = export_replay_timing(data, args.experiment_duration_seconds)
-                file_hash = write_trace(output / filename, data)
-                manifest['files'].append(dict(file=filename, sha256=file_hash, group=group,
-                    algorithm=label, qcnm_noise_rtol=variant['qcnm_noise_rtol'], load_erlang=load, power_dbm=power, seed=seed,
-                    traffic_sha256=digest, state_count=len(data['states'])))
+                manifest['files'].append(dict(file=filename, sha256=write_trace(output / filename, trace)))
                 print(f"[{len(manifest['files'])}/{len(experiments)*len(seeds)*len(algorithms)}] "
-                      f"{filename}: {len(data['states'])} states, SKR={metrics['skr_mean']:.1f} bit/s", flush=True)
+                      f"{filename}: {len(trace['states'])} states, SKR={metrics['skr_mean']:.1f} bit/s", flush=True)
     add_paired_synergy(runs, ('group', 'load_erlang', 'power_dbm', 'seed'))
     summary = summarize_business(runs)
     summary = {group: select_comparison_rows(rows, variants, ('load_erlang', 'power_dbm'))
                for group, rows in summary.items()}
     runs = select_comparison_rows(runs, variants, ('group', 'load_erlang', 'power_dbm', 'seed'))
-    # 配对协同度在所有算法完成后计算；索引保留每种子值和跨种子汇总。
+    # config 记录本次实验实际生效的仿真参数与模型版本，供实验端和各算法回放核对；
+    # 指标口径与数据格式说明写在代码注释与 traffic_export 模块说明里，不写进结果文件。
+    config = create_config(args, sim, algorithm_labels=algorithms, warmup=warmup,
+                           seeds=seeds, loads=loads, powers=sorted(powers), fixed_load=fixed_load,
+                           fixed_power=args.fixed_power, variants=variants)
+    config['experiment_duration_seconds'] = args.experiment_duration_seconds
+    # 配对协同度所需标尺取自同工况单次结果，随 config 一起导出便于复算。
+    for key in ('synergy_skr_lower', 'synergy_skr_upper',
+                'synergy_reference_launch_power_w', 'synergy_reference_xt_power_w'):
+        config[key] = runs[0].get(key)
+    write_trace(output / 'config.json', config)
+    # manifest 复用批次开始时创建的字典，保留 loop 中写入的逐次回放文件清单。
     manifest.update(runs=runs, summary=summary)
-    artifacts = export_business_summary(output, runs, metadata, summary)
+    artifacts = export_business_summary(output, runs, config, summary)
     manifest['artifacts'] = [dict(file=name, sha256=sha256((output / name).read_bytes()).hexdigest())
                              for name in artifacts]
     # 索引最后写入才表示批次完成；中途失败可能留下不完整文件，重跑应使用新目录。

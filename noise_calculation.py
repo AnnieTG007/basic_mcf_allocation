@@ -8,6 +8,14 @@ import math
 import numpy as np
 
 
+# 经典侧共用的物理常数：本项目的 OSNR 与协同度标尺必须使用同一组数值，只在下面定义一次。
+# 单跳接收衰减 0.2 dB/km；固定噪声底 3.21e-9 W 为参考业务口径给定值，单位待与实验条件核对。
+CLASSICAL_FIBER_LOSS_DB_PER_KM = 0.2
+CLASSICAL_NOISE_FLOOR_W = 3.21e-9
+# 协同度经典标尺的下限按 6 个正向串扰源叠加，与七芯中经典芯数减一一致。
+CLASSICAL_XT_SOURCE_COUNT = 6
+
+
 # GNPy v3.0.1 的标准单模光纤（SSMF）默认拉曼谱，原始精度不变。
 # 来源：https://github.com/Telecominfraproject/oopt-gnpy/blob/fd32bf544310ac76172224bf2c2054a7d4e6d87a/gnpy/core/parameters.py
 RAMAN_MODEL = 'gnpy_ssmf_thermal_v1'
@@ -247,20 +255,6 @@ class MulticoreFiber:
         # 两偏振噪声从每 Hz 转为每 m 波长；传播公式再乘一次 width，采用窄带近似。
         return 2 * h * f_signal * gain_thermal * f_signal ** 2 / self.c
 
-    def get_inter_forward_raman_scatter(self, p, z, eta):
-        """返回芯间前向拉曼功率（W）；p 为泵浦功率（W），z 为距离（m），eta 为谱系数（m^-2）。"""
-        # 原式要求 loss_q-loss_c 及 loss_q-loss_c-2*hmn 非零，未处理这两个奇点。
-        return eta * p * np.exp(-self.loss_q * z) * (
-                (np.exp((self.loss_q - self.loss_c) * z) - 1) / (self.loss_q - self.loss_c)
-                - (np.exp((self.loss_q - self.loss_c - 2 * self.hmn) * z) - 1) / (
-                        self.loss_q - self.loss_c - 2 * self.hmn)) * self.width
-
-    def get_inter_backward_raman_scatter(self, p, z, eta):
-        """返回芯间后向拉曼功率（W），输入含义与单位同前向拉曼接口。"""
-        return eta * p * ((np.exp(-(self.loss_q + self.loss_c + 2 * self.hmn) * z) - 1) / (
-                self.loss_q + self.loss_c + 2 * self.hmn)
-                          - (np.exp(-(self.loss_q + self.loss_c) * z) - 1) / (self.loss_q + self.loss_c)) * self.width
-
     def get_raman_power(self, ls_f: np.array, ls_p: np.array, ls_quantum: np.ndarray,
                         function, z: np.ndarray):
         """按原泵浦顺序累加拉曼噪声，返回 [目标频点, 距离] 功率数组（W），无泵浦时为零。"""
@@ -274,6 +268,20 @@ class MulticoreFiber:
                 eta = self.get_raman_eta(ls_f[pump_index], signal)
                 out_p[target_index] += function(ls_p[pump_index], z, eta)
         return out_p
+
+    def get_inter_forward_raman_scatter(self, p, z, eta):
+        """返回芯间前向拉曼功率（W）；p 为泵浦功率（W），z 为距离（m），eta 为谱系数（m^-2）。"""
+        # 原式要求 loss_q-loss_c 及 loss_q-loss_c-2*hmn 非零，未处理这两个奇点。
+        return eta * p * np.exp(-self.loss_q * z) * (
+                (np.exp((self.loss_q - self.loss_c) * z) - 1) / (self.loss_q - self.loss_c)
+                - (np.exp((self.loss_q - self.loss_c - 2 * self.hmn) * z) - 1) / (
+                        self.loss_q - self.loss_c - 2 * self.hmn)) * self.width
+
+    def get_inter_backward_raman_scatter(self, p, z, eta):
+        """返回芯间后向拉曼功率（W），输入含义与单位同前向拉曼接口。"""
+        return eta * p * ((np.exp(-(self.loss_q + self.loss_c + 2 * self.hmn) * z) - 1) / (
+                self.loss_q + self.loss_c + 2 * self.hmn)
+                          - (np.exp(-(self.loss_q + self.loss_c) * z) - 1) / (self.loss_q + self.loss_c)) * self.width
 
     # ICXT 原式的 km 与 km^-1 换算因子抵消，统一使用 m 与 m^-1。
     def get_forward_icxt_power(self, distance, power):
@@ -294,55 +302,49 @@ class MulticoreFiber:
         return 'Multicore, hmn={}/m'.format(self.hmn)
 
 
-@dataclass(frozen=True)
-class NoiseModel:
-    """组合最近邻、次近邻两组光纤参数，共用内置 GNPy 拉曼谱，远芯不参与量子噪声汇总。"""
-    first_fiber: MulticoreFiber  # 最近邻芯使用的光纤参数。
-    secondary_fiber: MulticoreFiber  # 次近邻芯使用的光纤参数。
+# 经典 OSNR 模型版本，随结果导出，便于判断历史结果的公式口径。
+OSNR_MODEL_VERSION = 'shared_fiber_icxt_v2'
 
 
-class ClassicalOSNRScorer:
-    """计算单链路两方向经典占用信道的线性 OSNR，空闲时返回 None。
-    噪声仅含同频 ICXT 和固定噪声底，不含 FWM 或拉曼。"""
-    def __init__(self, noise_model):
-        """接收 NoiseModel 中的两组邻芯光纤参数，并保存最近一次评分的统计量。"""
-        self.noise_model = noise_model
-        self.statistics = {}
-
-    def __call__(self, resources, powers, distances, first, secondary, link):
-        """汇总 link（如 (0, 1)）两方向的接收信号和噪声，返回线性功率比并更新 statistics。"""
-        # resources/powers 按 [源, 目的, 芯, 信道] 排列；状态 2 表示经典占用，功率单位 W。
-        # distances 为节点间距离矩阵 m；first/secondary 按芯索引列出最近邻/次近邻芯。
-        # signal_sum/xt_sum 为占用格信号/串扰总功率 W，count/zero_count 为占用格/零串扰格数。
-        signal_sum = xt_sum = 0.0
-        count = zero_count = 0
-        a, b = link
-        length = float(distances[a, b])
-        for i, j in ((a, b), (b, a)):
-            for c, w in np.argwhere(resources[i, j] == 2):  # c 为芯编号，w 为信道索引。
-                noise = 0.0
-                for neighbors, fiber in ((first[c], self.noise_model.first_fiber),
-                                         (secondary[c], self.noise_model.secondary_fiber)):
-                    for neighbor in neighbors:
-                        # 前向项同样由受扰芯本方向功率门控，再使用邻芯功率计算串扰。
-                        if powers[i, j, c, w] != 0:
-                            noise += fiber.get_forward_icxt_power(length, float(powers[i, j, neighbor, w]))
-                        # 沿用参考规则：受扰芯反向同频有光时，才计入邻芯的反向串扰。
-                        if powers[j, i, c, w] != 0:
-                            noise += fiber.get_backward_icxt_power(length, float(powers[j, i, neighbor, w]))
-                # 接收信号沿用固定 0.2 dB/km 损耗，length 的单位为 m。
-                signal_sum += float(powers[i, j, c, w]) * 10 ** (-length * 0.2 * 1e-4)
-                xt_sum += noise
-                count += 1
-                zero_count += int(noise == 0)
-        noise_sum = xt_sum + count * 3.21e-9  # 每个占用格加入固定噪声底，W。
-        # *_sum_w 为功率总和，noise_per_channel_w 为每格均值；零串扰不等于零总噪声。
-        self.statistics = dict(
-            signal_sum_w=signal_sum, noise_sum_w=noise_sum, xt_sum_w=xt_sum,
-            floor_sum_w=count * 3.21e-9,
-            noise_per_channel_w=noise_sum/count if count else None,
-            occupied_channels=count, zero_noise_channels=zero_count)
-        return signal_sum/noise_sum if count else None
+def calculate_classical_osnr(resources, powers, distances, first, secondary,
+                             link, first_fiber, secondary_fiber):
+    """返回单链路双向经典 OSNR 及信号、噪声统计字典；空闲时 osnr_linear 为 None。
+    first_fiber/secondary_fiber 为最近/次近邻光纤对象；link 如 (0, 1)，只计 ICXT 和固定底噪。"""
+    # resources/powers 按 [源, 目的, 芯, 信道] 排列；状态 2 表示经典占用，功率单位 W。
+    # distances 为节点间距离矩阵 m；first/secondary 按芯索引列出最近邻/次近邻芯。
+    # signal_sum/xt_sum 为占用格信号/串扰总功率 W，count/zero_count 为占用格/零串扰格数。
+    signal_sum = xt_sum = 0.0
+    count = zero_count = 0
+    a, b = link
+    length = float(distances[a, b])
+    for i, j in ((a, b), (b, a)):
+        for c, w in np.argwhere(resources[i, j] == 2):  # c 为芯编号，w 为信道索引。
+            noise = 0.0
+            for neighbors, fiber in ((first[c], first_fiber),
+                                     (secondary[c], secondary_fiber)):
+                for neighbor in neighbors:
+                    # 前向项同样由受扰芯本方向功率门控，再使用邻芯功率计算串扰。
+                    if powers[i, j, c, w] != 0:
+                        noise += fiber.get_forward_icxt_power(
+                            length, float(powers[i, j, neighbor, w]))
+                    # 受扰芯反向同频有光时，才计入邻芯的反向串扰。
+                    if powers[j, i, c, w] != 0:
+                        noise += fiber.get_backward_icxt_power(
+                            length, float(powers[j, i, neighbor, w]))
+            # 接收信号按 CLASSICAL_FIBER_LOSS_DB_PER_KM 衰减，length 的单位为 m。
+            signal_sum += float(powers[i, j, c, w]) * 10 ** (
+                -length * CLASSICAL_FIBER_LOSS_DB_PER_KM * 1e-4)
+            xt_sum += noise
+            count += 1
+            zero_count += int(noise == 0)
+    noise_sum = xt_sum + count * CLASSICAL_NOISE_FLOOR_W  # 每个占用格加入固定噪声底，W。
+    # *_sum_w 为功率总和，noise_per_channel_w 为每格均值；零串扰不等于零总噪声。
+    return dict(
+        osnr_linear=signal_sum/noise_sum if count else None,
+        signal_sum_w=signal_sum, noise_sum_w=noise_sum, xt_sum_w=xt_sum,
+        floor_sum_w=count * CLASSICAL_NOISE_FLOOR_W,
+        noise_per_channel_w=noise_sum/count if count else None,
+        occupied_channels=count, zero_noise_channels=zero_count)
 
 
 def noise_power_to_counts(power, frequencies, detector):
@@ -354,52 +356,17 @@ def noise_power_to_counts(power, frequencies, detector):
             / (6.62607015e-34 * np.asarray(frequencies, dtype=float)))
 
 
-def _neighbor_noise_components(fiber, neighbors, forward_powers, backward_powers,
-                               frequencies, quantum_frequencies, z):
-    """按 neighbors 中的芯编号汇总噪声，依次返回前/后向拉曼、前/后向 FWM 功率（W）。"""
-    # fiber 为该组邻芯的光纤参数，双向功率按 [芯, 信道] 排列；频率 Hz、距离 z 为 m 数组。
-    # components 按 [四种噪声分量, 量子频点, 距离] 排列，如 (4, 2, 1)。
-    components = np.zeros((4, len(quantum_frequencies), len(z)), dtype=float)
-    directions = (
-        (forward_powers, fiber.get_inter_forward_raman_scatter,
-         fiber.get_intercore_four_wave_mixing),
-        (backward_powers, fiber.get_inter_backward_raman_scatter,
-         fiber.get_backward_intercore_four_wave_mixing),
-    )
-    for core in neighbors:
-        for direction, (powers, raman_function, fwm_function) in enumerate(directions):
-            components[direction] += fiber.get_raman_power(
-                frequencies, powers[core], quantum_frequencies, raman_function, z)
-            components[direction + 2] += fiber.get_fwm_power(
-                frequencies, powers[core], quantum_frequencies, fwm_function, z)[1]
-    return components
-
-
-def calculate_noise_core(i, j, c, m_resourceMap, P_link, m_dis,
-                         available_channel, first_neighbor, secondary_neighbor, noise_model):
-    """返回链路 i→j、纤芯 c 各量子信道的噪声功率一维数组（W），保持原信道顺序。
-    仅汇总最近邻和次近邻的双向拉曼、FWM；无量子信道时返回空数组。"""
-    # i/j/c 为源节点/目的节点/芯编号，如 0/1/6；资源与 P_link 按 [源, 目的, 芯, 信道] 排列。
-    # P_link 为功率 W，m_dis 为距离矩阵 m，available_channel 为信道频率数组 Hz。
-    # 两组 neighbor 按芯列出邻居，noise_model 提供对应光纤；ICXT 不加入实际量子噪声。
-    frequencies = np.asarray(available_channel)
-    quantum_frequencies = frequencies[m_resourceMap[i, j, c] == 3]
-    # 状态 3 选量子频点，状态 2 选经典泵浦；屏蔽其他格内可能残留的功率。
-    active_forward = np.where(m_resourceMap[i, j] == 2, P_link[i, j], 0.0)
-    active_backward = np.where(m_resourceMap[j, i] == 2, P_link[j, i], 0.0)
-    z = np.array([m_dis[i][j]])
-
-    first = _neighbor_noise_components(
-        noise_model.first_fiber, first_neighbor[c], active_forward, active_backward,
-        frequencies, quantum_frequencies, z)
-    secondary = _neighbor_noise_components(
-        noise_model.secondary_fiber, secondary_neighbor[c], active_forward, active_backward,
-        frequencies, quantum_frequencies, z)
-
-    # 保持先拉曼、后 FWM 的浮点求和顺序，避免改变噪声及密钥率的数值结果。
-    noise_sum = (first[0] + first[1] + secondary[0] + secondary[1]
-                 + first[2] + first[3] + secondary[2] + secondary[3])
-    noise_sum = np.asarray(noise_sum, dtype=float).reshape(-1)
-    if noise_sum.size != len(quantum_frequencies):
-        raise ValueError("Expected one noise value per quantum channel")
-    return noise_sum
+def calculate_intercore_noise_components(fiber, frequencies, powers, quantum_frequencies,
+                                        z, backward=False):
+    """计算一个经典芯对目标量子频点的拉曼与四波混频（FWM）噪声。
+    依次返回拉曼、FWM 两个 [目标频点, 距离] 功率数组（W），不筛选资源状态或汇总其他芯。"""
+    # fiber 为源芯与目标芯对应的光纤对象；frequencies/quantum_frequencies 单位 Hz。
+    # powers 为源芯各频点有效功率（W，空闲置零）；z 为距离数组（m，如 [1000]）。
+    # backward=True 表示经典光相对量子光反向传播，默认同向。
+    raman_function = (fiber.get_inter_backward_raman_scatter if backward
+                      else fiber.get_inter_forward_raman_scatter)
+    fwm_function = (fiber.get_backward_intercore_four_wave_mixing if backward
+                    else fiber.get_intercore_four_wave_mixing)
+    raman = fiber.get_raman_power(frequencies, powers, quantum_frequencies, raman_function, z)
+    fwm = fiber.get_fwm_power(frequencies, powers, quantum_frequencies, fwm_function, z)[1]
+    return raman, fwm
