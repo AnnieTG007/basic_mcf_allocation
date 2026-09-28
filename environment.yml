@@ -1,5 +1,5 @@
 # Run from the project root. This is a rebuild recipe, not a full environment lock.
-name: mcf-resource-allocation
+name: mcf_resource_allocation
 channels:
   - conda-forge
 dependencies:
