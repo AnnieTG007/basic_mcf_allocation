@@ -1,50 +1,5 @@
-"""把仿真状态和已算好的统计写成资源回放 JSON、Excel 工作簿与图表。
-
-由 traffic_scan 或 main.py 的离线重导出入口调用；不生成业务、不决定分配、不推进时间。输出路径由调用方给出。
-回放 kind=qkd_resource_timeline、schema_version=3，config.algorithm 含 QCNM 容差标签，
-不另存重复的算法名和容差字段；config 还说明频率、芯分组、
-功率 dBm 和 config.time_unit 指定的回放时间单位。initial_occupancy 为初始状态，states 为每次资源
-改变后的 {time, event, group_id, occupancy}，包含预热段。终点清空事件为
-horizon_release，带 group_ids，仅结束回放，不冒充自然离去、不改变仿真统计。
-
-本回放用于 --export-business 全网三芯实验，保留经过所选链路的已接入业务和全网阻塞到达。
-完整路由保留在 path，hops 和 occupancy 只含所选链路；全网阻塞统计在 metrics。
-business_groups 每条记录是一组到达：
-group_id、source/destination、direction、arrival_time、holding_time、scheduled_end_time、
-status（accepted/blocked）、release_time、release_reason（natural/horizon）。
-source/destination/direction 描述端到端业务；回放传播方向必须读取 hops.direction，
-不能由端到端节点编号推断。allocation 含完整 path 和选中链路的 hops（link/direction/cores/physical_cores）、
-channel_index、frequency_hz 和 wavelength_nm。cores 为零起始仿真编号，physical_cores
-为物理芯号，不包含硬件端口。同组同方向三芯占用一致，两个方向可复用同一波长。
-负载单位为三芯业务组 Erlang，到达率单位见 arrival_rate_unit，功率为每芯每信道输入功率。
-
-occupancy 的维度为 [有向链路, 仿真芯, 经典信道]，链路顺序见 directed_links。
--2 表示该方向不可用，-1 表示空闲，非负整数为占用业务 ID（0 也表示占用）。
-量子资源只写在 config 中；经典索引从 0 开始，长度由经典信道数决定，
-默认 10 个依次对应 C40 至 C36、C34、C32 至 C29（跳过 C33），
-不是 ITU 编号，也不是包含量子频率的仿真内部索引。跨量子频段及跳过 C33
-均形成缺口，应读取实际 classical_frequencies_hz。
-
-版本 3 沿用版本 2 的资源结构，增加阻塞记录、source_simulation、simulation_statistics
-和 config.time_scale/time_scale_unit；阻塞的 allocation/release_time/release_reason 为 null，
-states 中 blocked 事件保持占用不变。同刻事件必须按数组顺序回放，不重新排序。
---experiment-duration-seconds 3600 将总时长100换为3600秒、预热10换为360秒，
-平均保持4换为144秒，到达率除以36，Erlang不变。config 为回放参数；
-metrics/samples 仍为原仿真统计，samples.time 不作为回放事件时间使用。
---reexport-traffic 可直接读取已有 JSON 换算，不重新运行分配；旧版缺失的阻塞记录
-用 blocked_records_scope=not_recorded_in_source_v2 标记，不能由统计数值补造。
-实验端直接读取此 JSON 的 initial_occupancy、business_groups、states；horizon_release
-按数组原位置执行，scheduled_end_time 即使超过终点也不截断。无需 allocation plan。
-回放配置仅保留实际工况、单位、资源映射及终点策略；算法原理和统计解释写在代码
-注释与批次 manifest，不逐文件重复。metrics/samples 和对应 skr_model 保留用于
-核对原仿真结果。JSON 按字段和记录换行，芯号、频率及单芯占用等数值数组保持一行。
-
-扫描工作簿仅含 Summary；业务工作簿仅含 LoadSweep/PowerSweep。表格为普通黑白
-单元格，仅含条件、算法、SKR/OSNR/阻塞率/协同度及四项各自相对FF的比值。
-完整配置、逐种子数据与样本保留在JSON。JSON 的 SKR 为 bit/s，趋势图和表格
-为 kbit/s；它们表示密钥生成速率而非累计密钥比特。误差范围是种子
-均值间的样本标准差，单种子时不显示；空白表示未定义而非零。
-"""
+"""由 main 或 traffic_scan 调用，将仿真状态及统计结果导出为回放 JSON、Excel 和图表。
+输出目录由调用方指定，本模块不生成业务、执行分配或重算统计。"""
 from dataclasses import asdict
 from copy import deepcopy
 from hashlib import sha256
@@ -65,25 +20,25 @@ CORE_TO_PHYSICAL = [2, 3, 4, 5, 6, 7, 1]
 
 
 class TrafficRecorder:
-    """按事件发生后的资源归属记录回放，不参与分配。
-
-    occupancy[有向链路][仿真芯][经典信道] 保存业务 ID，阻塞事件不改变占用。
-    固定量子芯/频率单独放在 config 中。物理芯映射只适用于七芯布局。
-    """
+    """观察已完成事件并记录所选链路的资源归属，生成三芯业务回放。"""
 
     def __init__(self, sim, *, seed, warmup):
-        if not sim.allocator.bind_three:
-            raise ValueError('Business trace requires a three-core experiment allocator')
+        """接收三芯实例 sim，记录随机种子 seed（如 53）和预热时长 warmup（仿真时间单位）。"""
+        if not sim.bind_three:
+            raise ValueError('Business trace requires a three-core experiment')
         self.sim = sim
         a, b = sim.observed_link
         self.links = [(a, b), (b, a)]
         self.link_index = {tuple(link): i for i, link in enumerate(self.links)}
+        # occupancy[有向链路][仿真芯][经典信道]：-2 不可用、-1 空闲、非负整数为业务编号。
         self.occupancy = [
             [[-1 if sim.m_resourceMap[a, b, c, w] == 1 else -2
               for w in range(sim.quantum_wave_num, sim.WaveNumber)]
              for c in range(sim.core_num)] for a, b in self.links]
+        # 量子资源只存配置；经典索引从零开始，频段缺口应读取频率表，不能按索引连续推算。
         self.config = dict(
-            algorithm='first-fit' if sim.algorithm == 'FF' else sim.algorithm.lower(),
+            allow_bidirectional=sim.allow_bidirectional,
+            algorithm=sim.algorithm,
             seed=int(seed), duration=float(sim.Ts), warmup=float(warmup),
             observed_link=list(sim.observed_link), allocation_scope='full_network',
             network_node_count=len(sim.graph), network_edge_count=sim.graph.number_of_edges(),
@@ -115,17 +70,14 @@ class TrafficRecorder:
             first_fiber=asdict(sim.noise_model.first_fiber),
             secondary_fiber=asdict(sim.noise_model.secondary_fiber),
         )
+        # 保存预热前初态，states 依事件原顺序记录，包含预热及同刻事件。
         self.initial = deepcopy(self.occupancy)
         self.active = {}
         self.states = []
         self.business_groups = []
 
     def record(self, event, *, blocked=False):
-        """记录观测链路已接入组和全网阻塞到达；阻塞不占用资源。
-
-        业务组和 states 的 group_id 对应；离去沿用到达时的三芯成员。
-        每次事件核对回放与真实资源/功率，避免在导出阶段凭空复制三芯占用。
-        """
+        """记录所选链路的已接入组与全网阻塞到达，并核对回放是否与实际资源一致。"""
         bid = int(event.m_id)
         arrival = bool(event.m_eventType['Arrival'])
         # 阻塞不一定有工作路径，先保留记录；成功业务只导出观测链路部分。
@@ -135,6 +87,7 @@ class TrafficRecorder:
         elif bid not in self.active:
             return
         if arrival:
+            # 端到端方向只描述业务；实验回放须使用 allocation.hops 中逐跳方向。
             service = dict(group_id=bid, source=int(event.m_sourceNode), destination=int(event.m_destNode),
                 direction='forward' if event.m_sourceNode < event.m_destNode else 'backward',
                 arrival_time=float(event.m_time), holding_time=float(event.m_holdTime),
@@ -145,6 +98,7 @@ class TrafficRecorder:
             if not blocked:
                 path = [int(n) for n in event.m_workPath]
                 frequency = float(self.sim.available_channel[event.m_ocuppiedwave])
+                # path 保留完整路由，hops 仅含观测链路；物理芯号不代表硬件端口。
                 service['allocation'] = dict(path=path,
                     hops=[dict(link=[a, b], direction='forward' if a < b else 'backward',
                                cores=[int(c) for c in cores],
@@ -162,6 +116,7 @@ class TrafficRecorder:
             self._update(service, kind)
             self.states.append(dict(time=float(event.m_time), event=kind,
                                     group_id=bid, occupancy=deepcopy(self.occupancy)))
+        # 阻塞保留到达记录，但分配和释放字段为空，占用状态不变。
         if blocked:
             self.states.append(dict(time=float(event.m_time), event='blocked',
                                     group_id=bid, occupancy=deepcopy(self.occupancy)))
@@ -196,12 +151,9 @@ class TrafficRecorder:
                 raise ValueError('Three-core trace disagrees with actual resource or per-core power')
 
     def finish(self, metrics, source_hashes):
-        """返回回放；终点仍活跃组标记 horizon 释放，不修改仿真资源和统计。
-
-        scheduled_end_time 保留自然结束计划，release_time 是回放中的释放时间。
-        这里保留仿真单位；export_replay_timing 在序列化副本中换算实际秒数。
-        """
+        """生成含终点释放记录的回放字典，保留原仿真时间单位，不修改仿真资源或指标。"""
         self._check_state()
+        # 终点强制释放只结束回放；计划离去时间可超过终点，不能解释成自然离去。
         for bid in sorted(self.active):
             self.active[bid].update(release_time=float(self.sim.Ts), release_reason='horizon')
             self._update(self.active[bid], 'leave')
@@ -218,17 +170,8 @@ class TrafficRecorder:
 
 
 def export_replay_timing(data, duration_seconds=None):
-    """返回版本 3 的独立副本；不调用分配器，不改输入记录、顺序或统计值。
-
-    config 是回放参数；source_simulation 保存原仿真时间参数、负载和来源版本。
-    time_scale 为输出时间单位/仿真单位；秒制时即 s/unit，未换算时为 1。
-    metrics 和 samples 原样保留，simulation_statistics.time_unit 为仿真单位。
-    精简 config 及统计说明，删除两个顶层重复哈希；其他顶层字段保持原样。
-    所有业务时间及 states.time 乘同比例系数，计划结束允许超过回放终点。
-    版本 2 曾丢弃阻塞记录，离线重导出无法恢复，必须显式标记缺失。
-    已为秒制的版本 3 可再次指定总时长，按当前时长换算，来源参数不覆盖。
-    duration_seconds=None 只升级格式和补充来源，保留现有时间单位。
-    """
+    """将 data 回放升级为版本 3 的独立副本，按 duration_seconds 换算总时长。
+传入 None 时保留现有时间单位；输入记录、事件顺序和统计值不变。"""
     if data.get('kind') != 'qkd_resource_timeline' or data.get('schema_version') not in (2, 3):
         raise ValueError('仅支持 qkd_resource_timeline 版本 2/3')
     result = deepcopy(data)
@@ -238,6 +181,7 @@ def export_replay_timing(data, duration_seconds=None):
         raise ValueError('原回放 duration 必须为有限正数')
     if config['time_unit'] not in ('simulation_unit', 's'):
         raise ValueError('不支持的回放时间单位')
+    # 首次保存原仿真参数；已换为秒的回放再次缩放时仍保留同一来源。
     if 'source_simulation' not in result:
         if config['time_unit'] != 'simulation_unit':
             raise ValueError('秒制回放缺少原仿真来源信息')
@@ -249,6 +193,7 @@ def export_replay_timing(data, duration_seconds=None):
     if duration_seconds is not None:
         if not math.isfinite(duration_seconds) or duration_seconds <= 0:
             raise ValueError('实验总时长必须为有限正数（秒）')
+        # 如 100 个时间单位换为 3600 秒，时间乘 36，到达率除 36，Erlang 负载不变。
         factor = duration_seconds / current_duration
         if not math.isfinite(factor) or factor <= 0:
             raise ValueError('时间换算系数超出数值范围')
@@ -257,6 +202,7 @@ def export_replay_timing(data, duration_seconds=None):
         config['duration'] = float(duration_seconds)
         config['arrival_rate'] /= factor
         config.update(time_unit='s', arrival_rate_unit='three-core groups per second')
+        # 只换算业务与回放事件时间；metrics/samples（含 samples.time）保持原仿真单位。
         for service in result['business_groups']:
             for key in ('arrival_time', 'holding_time', 'scheduled_end_time', 'release_time'):
                 if service[key] is not None:
@@ -265,11 +211,13 @@ def export_replay_timing(data, duration_seconds=None):
             state['time'] *= factor
     config['time_scale'] = config['duration'] / source['duration']
     config['time_scale_unit'] = config['time_unit'] + ' per simulation_unit'
+    # 版本 2 缺失的阻塞记录无法由统计值补造，只标记来源缺口。
     config.setdefault('blocked_records_scope', 'not_recorded_in_source_v2')
+    # 同刻事件及终点释放均按原数组顺序回放，不重新排序。
     config['event_order'] = 'array_order'
     # 只输出回放实际使用的配置；算法说明和全网构建参数留在批次索引。
     replay_fields = (
-        'algorithm', 'seed', 'duration', 'warmup', 'time_unit',
+        'algorithm', 'seed', 'duration', 'warmup', 'time_unit', 'allow_bidirectional',
         'time_scale', 'time_scale_unit', 'mean_holding_time', 'arrival_rate',
         'arrival_rate_unit', 'offered_load_erlang', 'power_dbm', 'power_reference',
         'allocation_mode', 'directed_links', 'link_lengths_m', 'core_to_physical',
@@ -284,6 +232,7 @@ def export_replay_timing(data, duration_seconds=None):
             if not key.endswith('_definition') and key not in ('skr_reference', 'skr_security_scope')}
     # 统计值保持原样；时间窗口已由 source_simulation 给出，无需重复。
     result['simulation_statistics'] = dict(time_unit='simulation_unit')
+    # 移除两个顶层重复摘要，其余顶层数据原样保留。
     result.pop('source_sha256', None)
     result.pop('traffic_sha256', None)
     result['schema_version'] = TRACE_SCHEMA_VERSION
@@ -291,12 +240,9 @@ def export_replay_timing(data, duration_seconds=None):
 
 
 def write_trace(path, data):
-    """以 UTF-8 写缩进 JSON，字段及记录换行，简单数组单行，嵌套数组逐层换行。
-
-    排他新建避免覆盖原文件；拒绝 NaN/Infinity。返回文件 SHA-256 供批次索引使用。
-    递归只改变排版，不改变字典和数组顺序；manifest 同样使用此格式。
-    """
+    """以 UTF-8 排版写入 JSON 并返回 SHA-256 文件摘要；拒绝覆盖已有文件及非有限数值。"""
     def render(value, level=0):
+        """递归排版 JSON：字段和嵌套记录换行，简单数组单行，保持原有顺序。"""
         indent = '  ' * level
         child_indent = indent + '  '
         if isinstance(value, dict) and value:
@@ -317,22 +263,15 @@ def write_trace(path, data):
 
 
 def export_excel(path, tables):
-    """写普通黑白汇总表：条件、算法、四项指标及四项相对 first-fit 的比值。
-
-    优先使用统计层附带的 ff_reference；未选 FF 时仍可计算比值而不增加 FF 行。
-
-    tables 为 (表名, 已汇总记录, 条件字段) 列表；条件字段是 (键, 显示名) 序列，
-    同表内用全部条件配对 FF。记录使用普通扫描的指标键，SKR 输入 bit/s、输出
-    kbit/s；OSNR 数值列为 dB，比值使用跨种子平均线性 OSNR，不能相除 dB。
-    比值为算法均值/FF均值，不减1；分子/基准缺失或基准为零时留空。
-    FF 协同度恒为零，因此协同度比值列留空。只写汇总，不写配置、样本或图表。
-    """
+    """将 tables 汇总记录写为黑白工作簿，包含条件、算法、四项指标及相对 FF 的比值。"""
     from openpyxl import Workbook
     from openpyxl.styles import Alignment
     from openpyxl.utils import get_column_letter
 
+    # tables 如 [(表名, 汇总记录, [(条件键, 显示名)])]，同表用全部条件匹配基准。
     workbook = Workbook()
     workbook.remove(workbook.active)
+    # 秘密密钥率（SKR）由 bit/s 转 kbit/s；光信噪比（OSNR）显示 dB，比值使用线性值。
     metrics = [('skr_mean', 'SKR (kbit/s)', .001, '0.000'),
                ('osnr_db_mean', 'OSNR (dB)', 1, '0.000'),
                ('blocking_rate', 'Blocking rate', 1, '0.00%'),
@@ -347,13 +286,15 @@ def export_excel(path, tables):
         headers += ['SKR / FF', 'OSNR / FF (linear)', 'Blocking / FF', 'Synergy / FF']
         sheet.append(headers)
         baseline = {tuple(row[key] for key, _ in conditions): row for row in records
-                    if row['algorithm'] in ('FF', 'first-fit')}
+                    if row['algorithm'] == 'FF'}
         for row in records:
             key = tuple(row[key] for key, _ in conditions)
+            # 优先使用统计层附带的 FF 参考，内部补跑基准不必作为表格行导出。
             ref = row.get('ff_reference', baseline.get(key, {}))
             values = list(key) + [row['algorithm']]
             values += [row[metric] * factor if row[metric] is not None else None
                        for metric, _, factor, _ in metrics]
+            # 比值不减一；缺值或基准为零留空，FF 自身协同度为零，故该比值列为空。
             values += [row[metric] / ref[metric]
                        if row.get(metric) is not None and ref.get(metric) not in (None, 0)
                        else None for metric in ratio_keys]
@@ -371,19 +312,16 @@ def export_excel(path, tables):
 
 
 def annotate_max_gap(ax, points, metric, unit):
-    """points 为 (横轴值, 提出算法值, CCA值, 算法标签)，数值已转换为图中单位。
-
-    只比较同一横轴、同一场景的有限均值。SKR 选择 |提出算法/CCA-1| 最大点，
-    以无符号百分比标注，CCA<=0 时比例未定义，跳过。OSNR 选 dB 绝对差最大点，
-    标签保留提出算法减CCA的正负号。同分选较小横轴，全相等标0，缺配对则不标。
-    """
+    """在 ax 上标注 QCNM 相对 CCA 的最大指标差及对应容差，缺有效配对时不标注。"""
+    # points 为 (横轴值, QCNM 值, CCA 值, 容差标签)，数值已转为图中单位且按同工况配对。
     pairs = [(x, proposed, cca, algorithm) for x, proposed, cca, algorithm in points
              if proposed is not None and cca is not None
              and np.isfinite(proposed) and np.isfinite(cca)]
     if not pairs:
         return
+    # 最大差相同则选择较小横轴；全相等标零。SKR 用绝对百分比，OSNR 保留 dB 差的符号。
     if metric == 'SKR':
-        pairs = [p for p in pairs if p[2] > 0]
+        pairs = [p for p in pairs if p[2] > 0]  # CCA 非正时比例未定义。
         if not pairs:
             return
         x, proposed, cca, algorithm = max(pairs, key=lambda p: (abs(p[1] / p[2] - 1), -p[0]))
@@ -404,20 +342,13 @@ def annotate_max_gap(ax, points, metric, unit):
 
 
 def plot_scan(output, summary, scan_axis='load'):
-    """负载扫描每场景一张、功率/距离扫描每组一张 2×2 SVG：协同度、OSNR、SKR 和阻塞率。
-
-    只使用 summary 的均值和跨种子样本标准差，不从回放重算。
-    横轴由 scan_axis 选择负载/Erlang、每芯每信道功率/dBm 或统一边长/km。SKR 从 bit/s 转为 kbit/s，阻塞率显示为百分比。
-    标准差有有限值时绘制阴影；调用方将单种子标准差设为空，缺失值保留断点。
-    功率/距离扫描由调用方保证每个横轴值只对应一个场景。
-    仅 SKR、OSNR 面板标注 QCNM 与 CCA 的最大差：SKR 为绝对
-    百分比差，OSNR 为带符号 dB 差；在全部容差中选最大差并标出对应容差；同分选较小横轴，缺配对不标注。返回 SVG 文件名列表。
-    """
+    """将 summary 的均值和种子间标准差绘为四指标扫描图，返回 SVG 文件名列表。"""
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     from matplotlib.ticker import PercentFormatter
 
+    # summary 已完成跨种子汇总；负载按场景分图，功率/距离每个横轴值须只有一个场景。
     frame = pd.DataFrame(summary)
     colors = {name: plt.get_cmap('tab10')(i % 10)
               for i, name in enumerate(dict.fromkeys(frame.algorithm))}
@@ -434,7 +365,7 @@ def plot_scan(output, summary, scan_axis='load'):
             else f"power={frame.power_dbm.iloc[0]:g} dBm/core/channel"), frame)]
     for index, (scenario, group) in enumerate(groups, 1):
         fig, axes = plt.subplots(2, 2, figsize=(12, 8), layout='constrained')
-        specs = [('synergy_vs_FF', 'Signed synergy vs first-fit', 1),
+        specs = [('synergy_vs_FF', 'Signed synergy vs FF', 1),
                  ('osnr_db_mean', 'Reference link OSNR (dB)', 1),
                  ('skr_mean', 'Mean link SKR per channel (kbit/s)', .001),
                  ('blocking_rate', 'Blocking probability', 1)]
@@ -442,12 +373,14 @@ def plot_scan(output, summary, scan_axis='load'):
             for algorithm, data in group.groupby('algorithm', sort=False):
                 data = data.sort_values(x_key)
                 x, y = data[x_key].to_numpy(), data[metric].to_numpy(dtype=float)*factor
+                # 标准差是种子均值间的样本标准差；单种子不画阴影，缺均值处保留断点。
                 sd = data[metric + '_sd'].to_numpy(dtype=float)*factor
                 color = colors[algorithm]
                 ax.plot(x, y, marker='o', ms=4, lw=1.7, label=algorithm, color=color)
                 if np.isfinite(sd).any():
                     ax.fill_between(x, y - sd, y + sd, color=color, alpha=.12)
             ax.set_ylabel(label)
+        # 仅 SKR/OSNR 比较全部 QCNM 容差中的最大差，并标出对应容差。
         cca = group[group.algorithm == 'CCA'].set_index(x_key)
         for ax, metric, factor, label, unit in (
                 (axes[1, 0], 'skr_mean', .001, 'SKR', 'kbit/s'),
@@ -474,13 +407,7 @@ def plot_scan(output, summary, scan_axis='load'):
 
 
 def export_business_summary(output, runs, metadata, summary):
-    """生成黑白 LoadSweep/PowerSweep 简表及四指标的 PNG、SVG 趋势图。
-
-    工作簿只含条件、算法、四项指标及各自相对FF的比值，不嵌图；完整数据留在JSON。
-    图中仅标注提出算法与CCA的最大SKR绝对百分比差、OSNR差（dB），
-    在全部 QCNM 容差中取最大差，并标注对应容差；单图和总览共用同一规则。
-    标准差仍显示为误差棒；缺失均值处断线，重合曲线不平移，不添加额外差异标注。
-    """
+    """将业务汇总导出为 LoadSweep/PowerSweep 工作表及四指标的 PNG、SVG 图，返回文件名列表。"""
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -493,6 +420,7 @@ def export_business_summary(output, runs, metadata, summary):
          f"Power sweep | {metadata['fixed_load_erlang']:g} Erlang of three-core groups")]
     algorithms = list(dict.fromkeys(r['algorithm'] for r in runs))
     colors = {name: plt.get_cmap('tab10')(i % 10) for i, name in enumerate(algorithms)}
+    # 工作簿只保留两张汇总表，不嵌图；完整配置、种子与样本仍在 JSON 中。
     path = output / 'skr_summary.xlsx'
     tables = [(sheet, summary[group], [('load_erlang', 'Load (Erlang)'), ('power_dbm', 'Power (dBm)')])
               for group, sheet, *_ in specs]
@@ -502,7 +430,7 @@ def export_business_summary(output, runs, metadata, summary):
             f"{len(metadata['seeds'])} seed(s); " +
             ('error bars: across-seed SD' if len(metadata['seeds']) > 1 else 'single-seed trend'))
     metrics = [('osnr_db_mean', 'osnr_db_mean_sd', 'Reference link OSNR (dB)', 'osnr_trends.png', 'classical_osnr.png'),
-               ('synergy_vs_FF', 'synergy_vs_FF_sd', 'Signed synergy vs first-fit', 'synergy_trends.png', 'synergy.png'),
+               ('synergy_vs_FF', 'synergy_vs_FF_sd', 'Signed synergy vs FF', 'synergy_trends.png', 'synergy.png'),
                ('skr_mean', 'skr_mean_sd', 'Mean link SKR per channel (kbit/s)', 'skr_trends.png', 'total_skr.png'),
                ('blocking_rate', 'blocking_rate_sd', 'Classical blocking probability',
                 'blocking_trends.png', 'blocking_rate.png')]
@@ -522,6 +450,7 @@ def export_business_summary(output, runs, metadata, summary):
                 points = sorted((r for r in summary[group] if r['algorithm'] == algorithm), key=lambda r: r[x_key])
                 x = [r[x_key] for r in points]
                 y = [r[metric] * factor if r[metric] is not None else np.nan for r in points]
+                # 单种子不画误差棒；缺失值断线，重合曲线保持原位置。
                 sd = [r[sd_key] * factor if r[sd_key] is not None else None for r in points]
                 for target in (ax, single_ax):
                     target.plot(x, y, marker='o', ms=4, lw=1.8, label=algorithm, color=colors[algorithm])

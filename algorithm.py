@@ -1,303 +1,279 @@
-"""为一条已选路径选择共同信道和逐跳纤芯，不直接占用或释放资源。
-
-由 main.ClassicalService 通过 ResourceAllocator 调用。输入资源和功率数组
-为 [源节点, 目的节点, 芯, 信道]，资源状态 1 表示可用，2 表示经典占用，
-3 表示量子保留；功率 W、距离 m、实际频率 Hz。返回 (各跳芯列表, 信道索引)，
-无可用分配时为 (None, -1)。普通仿真全路径使用同一信道，中间节点可以换芯。
-仅实验导出启用 bind_three，此时每跳返回固定方向组的三芯列表，三芯同时加载。
-
-四种算法以 KeyConsumption_24node -7 core 的 Consumption_Dynamic.py
-及 algorithm_MY/FF/SCWA.py 为来源；其中 my 即 CQLI。CQLI/CCA/SCWA 沿用参考
-算法名称，参考源码未注明其英文全称。参考频率数组升序，故四者均
-按实际频率从低到高搜索。保留本项目频点和量子预留，不迁移参考仿真配置。
-FF（first-fit，遇到可用资源就选）与 CCA 双向共享经典芯，禁止反向同芯同频
-同时占用；CQLI 按方向分芯。FF 同频时按芯编号升序选择，七芯为 [0,1,2,3,4,5]，
-对应参考搜索函数 range(core_num)，而非参考初始化列表的书写顺序。
-CCA/CQLI 保留方向列表顺序；默认 CCA 为 [1,2,3,4,5,6]。
-SCWA 保留奇偶分芯偏好，但修复小网格的阈值和无回退问题：只统计经典可用
-位置，原首选集合占用比例达到参考的 14/24 时交换偏好；当前首选集合不能
-贯通全路径时放开另一集合。序号按全部实际频率升序从 0 编起，包括量子频点，
-但量子/禁用位置不计入占用率。这是可变信道数适配版，不等同于参考原版。
-三芯绑定是硬件实验扩展，使用固定方向分组，不等同于参考单芯 FF。
-QCNM（Quantum channel noise mitigation，量子信道噪声抑制）直接比较量子接收端的拉曼与 FWM 总噪声增量；
-不做 FWM 组合预筛选、奇偶分级或频差优先。噪声容差内优先选择同向同频的相邻芯占用数较少的候选。
-"""
+"""供调用方使用 ResourceAllocator(...).allocate(...)，从资源与功率状态选择共同信道和逐跳芯组。
+仅支持固定七芯配置，返回分配结果而不修改资源。"""
 import numpy as np
 
+from core_layout import SEVEN_CORE_LAYOUTS
 
+
+# ALGORITHMS 为唯一算法名称集合，例如命令行选择 'QCNM'。
 ALGORITHMS = ('CQLI', 'CCA', 'FF', 'SCWA', 'QCNM')
-QCNM_NOISE_RTOL = 0.10
-QCNM_NOISE_RTOLS = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5)
-
-
-def normalize_algorithm(value):
-    """统一大小写及连字符；first-fit 归为 FF、旧名 GREEDY_MIN_NOISE 归为 QCNM。"""
-    name = value.upper().replace('-', '_')
-    return {'FIRST_FIT': 'FF', 'GREEDY_MIN_NOISE': 'QCNM'}.get(name, name)
-
-
-class QuantumChannelNoiseMitigation:
-    """先限制量子端噪声增量，再优先选择同向同频的相邻芯占用数较少的分配。"""
-    def __init__(self, forward_cores, backward_cores, scorer, *, noise_rtol=QCNM_NOISE_RTOL):
-        self.forward = tuple(forward_cores)
-        self.backward = tuple(backward_cores)
-        self.scorer = scorer
-        self.frequencies = scorer.frequencies.copy()
-        if not np.isfinite(noise_rtol) or not 0 <= noise_rtol <= 1:
-            raise ValueError('QCNM noise_rtol must be finite and in [0, 1]')
-        self.noise_rtol = float(noise_rtol)
-
-    def _candidate(self, a, b, core, wave, launch_power, resources, powers, distance):
-        """返回本跳本芯加入 wave 的量子端总噪声增量 noise（W）及芯编号。
-
-        分数为加入前后芯间自发拉曼散射（SpRS）与芯间四波混频（FWM）光功率之差，
-        对各量子芯的所有量子频点求和。量子接收方向为小节点号到大节点号；
-        a>b 表示经典光反向传播。QuantumLinkScorer 判定最近/次近邻和方向，
-        并调用 noise_calculation 中的物理公式；远芯返回零是现有模型截断。
-        不计算经典端 OSNR（光信噪比）、暗计数或同频线性串扰，不增加拉曼谱或频差
-        的辅助排序。只修改功率副本，不占用资源；没有量子频点时增量为零。
-        """
-        i, j = sorted((a, b))
-        active = np.where(resources[a, b, core] == 2, powers[a, b, core], 0.0)
-        trial = active.copy()
-        trial[wave] = launch_power
-        total_delta = 0.0
-        for qc in np.flatnonzero(np.any(resources[i, j] == 3, axis=1)):
-            qi = tuple(int(q) for q in np.flatnonzero(resources[i, j, qc] == 3))
-            before_r, before_f = self.scorer.core_components(qc, core, a>b, active, qi, distance)
-            after_r, after_f = self.scorer.core_components(qc, core, a>b, trial, qi, distance)
-            total_delta += float(np.sum(after_r-before_r) + np.sum(after_f-before_f))
-        return dict(core=core, noise=total_delta)
-
-    def _same_direction_count(self, a, b, core, wave, resources):
-        """数本跳最近邻芯上同向、同频的经典占用数，每个占用计1。
-
-        相邻芯使用布局的 first 邻接表；只统计 resources[a,b,邻芯,wave]==2。
-        不计反向、次近邻和量子保留，不按功率或耦合系数加权，不计算串扰噪声。
-        """
-        return sum(int(resources[a, b, neighbor, wave] == 2)
-                   for neighbor in self.scorer.first[core])
-
-    def allocate(self, path, launch_power, resources, powers, distances):
-        """在给定路径上按总噪声增量选择共同频点和逐跳纤芯。
-
-        对每个全路径可用频点，逐跳求最小总噪声增量并相加；再在所有频点之间
-        求 Nmin。不设 FWM 安全等级、奇偶优先或频差优先，FWM 仅通过物理功率计分。
-        候选须满足 N <= Nmin+rtol*abs(Nmin)，默认 rtol=10%；Nmin=0 时无绝对容差。
-        每跳仅在该跳相同相对容差内选择同向同频邻芯占用数较少的芯，并复核全路径总和不超上述上限；
-        超限则恢复该频点的逐跳最低噪声芯。最终按邻芯占用计数之和、量子噪声增量、频点索引、
-        芯编号排序。rtol=0 时严格最小化本路径的总增量，精确同分仍优先减少同向同频邻芯占用。
-        正容差下是逐跳贪心，不穷举芯组合；容差不约束后续仿真的整体 SKR 损失。
-
-        路由顺序由 main 决定，本函数不跨候选路径比较分数；全路径同频，可逐跳换芯。
-        无可用资源或不足两节点返回 (None,-1)，不因噪声分数增加拒绝条件。
-        重复节点路径、非正或非有限功率报错；仅检查本方向空闲，不追加反向互斥。
-        三芯绑定由 ResourceAllocator._bound_three 对固定三芯组应用同样的
-        全路径噪声上限，再按已有同向同频邻芯占用数、噪声、信道索引排序。
-        """
-        if len(path) < 2:
-            return None, -1
-        if len(set(path)) != len(path):
-            raise ValueError('qcnm requires a simple path')
-        if not np.isfinite(launch_power) or launch_power <= 0:
-            raise ValueError('Launch power must be finite and positive')
-        options = []
-        for wave in range(resources.shape[-1]):
-            per_hop = []
-            for a, b in zip(path, path[1:]):
-                candidates = [self._candidate(a,b,c,wave,launch_power,resources,powers,distances[a,b])
-                              for c in (self.forward if a<b else self.backward)
-                              if resources[a,b,c,wave] == 1]
-                for candidate in candidates:
-                    candidate['neighbors'] = self._same_direction_count(
-                        a, b, candidate['core'], wave, resources)
-                if not candidates:
-                    break
-                per_hop.append(candidates)
-            if len(per_hop) != len(path)-1:
-                continue
-            chosen = [min(hop, key=lambda c: (c['noise'], c['neighbors'], c['core'])) for hop in per_hop]
-            options.append(dict(wave=wave, chosen=chosen, per_hop=per_hop))
-        if not options:
-            return None, -1
-        minimum = min(sum(c['noise'] for c in option['chosen']) for option in options)
-        limit = minimum + self.noise_rtol * abs(minimum)
-        ranked = []
-        for option in options:
-            original = option['chosen']
-            if sum(c['noise'] for c in original) > limit:
-                continue
-            wave = option['wave']
-            chosen = []
-            for hop in option['per_hop']:
-                local_min = min(c['noise'] for c in hop)
-                local_limit = local_min + self.noise_rtol * abs(local_min)
-                near = [c for c in hop if c['noise'] <= local_limit]
-                chosen.append(min(near, key=lambda c: (
-                    c['neighbors'], c['noise'], c['core'])))
-            if sum(c['noise'] for c in chosen) > limit:
-                chosen = original
-            neighbor_count = sum(c['neighbors'] for c in chosen)
-            cores = [c['core'] for c in chosen]
-            key = (neighbor_count, sum(c['noise'] for c in chosen), wave, tuple(cores))
-            ranked.append((key, cores, wave))
-        _, cores, wave = min(ranked, key=lambda candidate: candidate[0])
-        return cores, wave
 
 
 class ResourceAllocator:
-    """构造时传入算法、方向纤芯和评分器；每次分配显式传入实时状态。
+    """用五种算法在既定候选组中选择资源；组内所有芯必须在同一信道一起分配。"""
 
-    不持有仿真对象或资源快照，不修改传入数组。
-    """
-    def __init__(self, algorithm, forward_cores, backward_cores, frequencies, quantum_scorer=None,
-                 *, bind_three=False, noise_rtol=QCNM_NOISE_RTOL):
-        self.algorithm = normalize_algorithm(algorithm)
+    def __init__(
+            self,
+            algorithm,             # 算法名称，例如 'QCNM'，只接受 ALGORITHMS 中的名称。
+            forward_groups,        # 前向候选组，例如 [(0,), (2,)] 或 [(0, 2, 4)]。
+            backward_groups,       # 后向候选组，例如 [(1,), (3,)] 或 [(1, 3, 5)]。
+            frequencies,           # 信道索引对应的频率（Hz），例如 [193.5e12, 193.4e12]。
+            *,
+            allow_bidirectional=False,  # 是否允许同一纤芯、同一信道内双向同频数据信号同时传输；默认 False（不允许）。
+            # 芯是否能承载某方向由前后向候选列表决定；双向共有芯仍可波长 1 正向、波长 2 反向，本开关只约束同频。
+    ):
+        """前向指节点号小到大，后向相反；[(0,), (2,)] 是两个备选组，[(0, 2)] 是一个两芯组。"""
+        self.algorithm = algorithm
         if self.algorithm not in ALGORITHMS:
             raise ValueError(f"Unknown algorithm: {algorithm}")
         self.frequencies = np.asarray(frequencies, dtype=float)
         if (self.frequencies.ndim != 1 or not len(self.frequencies)
                 or not np.all(np.isfinite(self.frequencies)) or np.any(self.frequencies <= 0)):
             raise ValueError('frequencies must contain positive finite Hz values')
-        self.core_f = tuple(forward_cores)
-        self.core_b = tuple(backward_cores)
-        # 仅实验导出开启；普通仿真和负载扫描仍逐跳选单芯。
-        self.bind_three = bind_three
-        self.reverse_exclusive = self.algorithm in ('FF', 'CCA') and not bind_three
-        if bind_three and (self.algorithm not in ('FF', 'CCA', 'QCNM')
-                           or len(self.core_f) != 3 or len(self.core_b) != 3
-                           or len(set(self.core_f + self.core_b)) != 6):
-            raise ValueError('Three-core experiments require FF/CCA/QCNM and two disjoint three-core groups')
-        if self.algorithm == "QCNM" and quantum_scorer is None:
-            raise ValueError(f"{self.algorithm} requires a quantum receiver scorer")
+        # group 是必须一起分配的芯编号元组，例如 (0, 2, 4)；保存为元组，后续按固定表排序。
+        self.forward_groups = tuple(tuple(group) for group in forward_groups)
+        self.backward_groups = tuple(tuple(group) for group in backward_groups)
+        if any(not group for group in self.forward_groups + self.backward_groups):
+            raise ValueError('Candidate core groups must not be empty')
+        # layout 为本算法的固定七芯配置，例如 SEVEN_CORE_LAYOUTS['SCWA']。
+        layout = SEVEN_CORE_LAYOUTS[self.algorithm]
+        # groups/allowed 为方向候选及固定允许芯，例如 ((4,), (3,), (5,)) / (4,3,5)。
+        for groups, allowed in ((self.forward_groups, layout['classical_forward']),
+                                (self.backward_groups, layout['classical_backward'])):
+            if any(core not in allowed for group in groups for core in group):
+                raise ValueError('Candidate groups must use the fixed seven-core algorithm layout')
+        # 按固定表顺序排列候选；绑定约束不改变算法的芯搜索次序。
+        self.forward_groups = tuple(sorted(self.forward_groups, key=lambda group: tuple(
+            layout['classical_forward'].index(core) for core in group)))
+        self.backward_groups = tuple(sorted(self.backward_groups, key=lambda group: tuple(
+            layout['classical_backward'].index(core) for core in group)))
+        self.allow_bidirectional = allow_bidirectional
 
-        self.noise_policy = (QuantumChannelNoiseMitigation(self.core_f, self.core_b, quantum_scorer, noise_rtol=noise_rtol)
-                             if self.algorithm == "QCNM" else None)
-
-    def allocate(self, path, launch_power, *, resources, powers, distances):
-        """返回 (各跳芯列表, 共同信道索引)，失败为 (None, -1)。
-        
-        默认每跳返回单芯编号；仅 bind_three=True 时每跳返回三个芯的列表。
-        launch_power/powers 为 W，distances 为 m；不修改输入数组，实际占用/释放由 main 处理。
-        """
-        if self.bind_three:
-            return self._bound_three(path, launch_power, resources, powers, distances)
-        if self.noise_policy is not None:
-            return self.noise_policy.allocate(path, launch_power, resources, powers, distances)
-        if self.algorithm == "SCWA":
-            return self._scwa(path, resources)
-        return self._first_fit(path, resources)
-
-    def _bound_three(self, path, launch_power, resources, powers, distances):
-        """实验专用：返回 (逐跳三芯成员列表, 共同信道索引)，失败为 (None, -1)。
-
-        每跳按节点号选择方向组，三芯全部空闲才可接入，反向资源独立。
-        FF/CCA 按实际频率从低到高选第一个可行波长；CCA 使用实验专用方向三芯组。QCNM 先求全路径三芯的
-        最小拉曼与 FWM 总增量，再在相对噪声容差内最小化已有同向同频邻芯占用计数。
-        现有物理模型按经典芯相加，因此这等于三芯同时加载的增量，不是单芯乘三。
-        每芯每信道均加载 launch_power W；仅评分副本，main 的事件负责实际占用。
-        三芯强制同频，候选须满足 N <= Nmin + rtol*abs(Nmin)，随后按邻芯计数、
-        噪声、信道索引排序。默认固定方向三芯组中，可用波长的同向邻芯占用均为零，
-        因而不同容差可得到相同结果；不人为改变频率顺序以制造差异。
-        """
-        policy = self.noise_policy
+    def allocate(
+            self,
+            path,           # 简单路径的节点序列，例如 [0, 1, 2]；不跨候选路径比较分数。
+            launch_power,   # 每个新增芯信道的发射功率，例如 0.01 W。
+            *,
+            resources,      # [源节点, 目的节点, 芯, 信道] 状态数组，例如 resources[0,1,2,3]=1。
+            powers,         # 同维度已占用功率数组，例如 powers[0,1,2,3]=0.01 W。
+            distances,      # 节点距离矩阵，例如 distances[0,1]=1000 m。
+            **algorithm_options,  # QCNM 专用参数，如 noise_rtol=0.1 和 quantum_scorer。
+    ):
+        """返回 (逐跳芯组列表, 共同信道索引)，例如 ([[0], [2]], 3)；无可用分配返回 (None, -1)。"""
+        # QCNM 必须显式传入两个专用参数；缺参或向其他算法传入专用参数，由对应方法签名报 TypeError。
+        # resources 的 0/1/2/3 表示不可用/空闲经典/占用经典/量子保留；数组形状和索引由调用方保证。
+        if resources.ndim != 4 or resources.shape[2] != 7:
+            raise ValueError('Allocation algorithms support only the fixed seven-core layout')
         if len(path) < 2:
             return None, -1
         if len(set(path)) != len(path):
-            raise ValueError('Three-core experiments require a simple path')
+            raise ValueError('Allocation requires a simple path')
         if not np.isfinite(launch_power) or launch_power <= 0:
             raise ValueError('Launch power must be finite and positive')
-        groups = [list(self.core_f if a < b else self.core_b) for a, b in zip(path, path[1:])]
+        # methods 将算法名称映射到对应方法，例如 methods['FF'] 为 self._ff。
+        methods = {
+            'CQLI': self._cqli, 'CCA': self._cca, 'FF': self._ff,
+            'SCWA': self._scwa, 'QCNM': self._qcnm,
+        }
+        # chosen_groups/wave 为逐跳所选芯组及原信道索引，例如 ([(0,), (2,)], 3)。
+        # 专用参数原样转交对应算法，公共分配器不解释其含义。
+        chosen_groups, wave = methods[self.algorithm](
+            path, launch_power, resources, powers, distances, **algorithm_options)
+        if chosen_groups is None:
+            return None, -1
+        return [list(group) for group in chosen_groups], wave
+
+    # 以下五个方法共用 allocate 的路径、功率、资源和距离输入；专用参数只在对应方法声明。
+    # CQLI/CCA/SCWA 沿用参考名称，参考源码未注明英文全称；芯分组全部取固定七芯表。
+    def _cqli(self, path, launch_power, resources, powers, distances):
+        """CQLI 按低频优先搜索，同频按固定芯表顺序选择候选，例如先 (0,) 后 (2,)。"""
+        return self._first_fit(path, resources, sort_groups=False)
+
+    def _cca(self, path, launch_power, resources, powers, distances):
+        """CCA 按低频优先搜索，同频按固定芯表顺序选择候选，例如先 (1,) 后 (2,)。"""
+        return self._first_fit(path, resources, sort_groups=False)
+
+    def _ff(self, path, launch_power, resources, powers, distances):
+        """FF（first-fit，首次适配）按低频、组内芯编号排序搜索，例如 (0,) 先于 (2,)。"""
+        return self._first_fit(path, resources, sort_groups=True)
+
+    def _scwa(self, path, launch_power, resources, powers, distances):
+        """SCWA 按参考七芯表和信道索引奇偶分配，名义容量剩余不超过 10 时交换奇偶组，不做回退。"""
+        # odd_waves/even_waves 为原信道索引的奇偶列表，例如 11 个信道时为 [1,3,5,7,9] / [0,2,4,6,8,10]。
+        odd_waves = tuple(range(1, resources.shape[-1], 2))
+        even_waves = tuple(range(0, resources.shape[-1], 2))
+        # hops 保存各跳的候选和允许奇偶组，例如 (0,1,((4,),(3,),(5,)),(4,),(3,5),False)。
+        hops = []
+        # a/b 为本跳起止节点，例如 0/1；direction 是固定表的方向键，例如 'forward'。
+        for a, b in zip(path, path[1:]):
+            direction = 'forward' if a < b else 'backward'
+            # odd_cores/even_cores 为参考表固定芯号，例如前向 (4,) / (3,5)，不根据候选列表首项推导。
+            odd_cores = SEVEN_CORE_LAYOUTS['SCWA'][direction + '_odd']
+            even_cores = SEVEN_CORE_LAYOUTS['SCWA'][direction + '_even']
+            # groups 为本跳绑定候选，例如 ((4,), (3,), (5,))；core/wave 为芯号/信道索引，例如 4/1。
+            groups = self.forward_groups if a < b else self.backward_groups
+            # unavailable 为原奇偶分配中所有非空闲位置数，例如 14；状态 0、2、3 都计入。
+            unavailable = sum(resources[a, b, core, wave] != 1 for core in odd_cores for wave in odd_waves)
+            unavailable += sum(resources[a, b, core, wave] != 1 for core in even_cores for wave in even_waves)
+            # capacity 为参考名义容量，例如 16 信道时为 24；swapped 为是否交换，14 >= 24-10 时为 True。
+            capacity = len(odd_cores) * len(odd_waves) + len(even_cores) * len(even_waves)
+            swapped = unavailable >= capacity - 10
+            hops.append((a, b, groups, odd_cores, even_cores, swapped))
+        # 与参考 show_path_SCWA 一致，按原信道索引 0、1、2……搜索，不改用实际频率排序。
+        for wave in range(resources.shape[-1]):
+            # chosen_groups 为已选的逐跳芯组，例如 [(4,), (6,)]。
+            chosen_groups = []
+            for a, b, groups, odd_cores, even_cores, swapped in hops:
+                # allowed_cores 为本跳此信道允许的固定芯组，例如奇数信道未切换时为 (4,)。
+                allowed_cores = odd_cores if (wave % 2 == 1) != swapped else even_cores
+                # chosen 为第一个全组空闲且所有成员都在允许表中的候选，例如 (4,)，不存在为 None。
+                chosen = next((group for group in groups
+                               if all(core in allowed_cores for core in group)
+                               and self._available(a, b, group, wave, resources)), None)
+                if chosen is None:
+                    break
+                chosen_groups.append(chosen)
+            if len(chosen_groups) == len(path) - 1:
+                return chosen_groups, wave
+        return None, -1
+
+    def _qcnm(
+            self, path, launch_power, resources, powers, distances,
+            *,
+            noise_rtol,      # 相对噪声容忍系数，无量纲；例如 0.1 允许噪声增量高于最小值 10%。
+            quantum_scorer,  # 物理噪声计算对象，如 QuantumLinkScorer；core_components 返回拉曼/四波混频（FWM）功率（W）。
+    ):
+        """QCNM（Quantum channel noise mitigation，量子信道噪声抑制）在噪声增量容差内优先减少同向同频邻芯占用。"""
+        if quantum_scorer is None:
+            raise ValueError('QCNM requires a quantum receiver scorer')
+        if not np.isfinite(noise_rtol) or not 0 <= noise_rtol <= 1:
+            raise ValueError('QCNM noise_rtol must be finite and in [0, 1]')
+        noise_rtol = float(noise_rtol)
+        # options 保存各可贯通信道，例如 {'wave': 3, 'chosen': [...], 'per_hop': [[...]]}。
         options = []
-        for wave in sorted(range(resources.shape[-1]), key=lambda w: (self.frequencies[w], w)):
-            if not all(np.all(resources[a, b, cores, wave] == 1)
-                       for a, b, cores in zip(path, path[1:], groups)):
+        # wave 为原信道索引，例如 3；QCNM 最终按原索引破同分，不按实际频率重排。
+        for wave in range(resources.shape[-1]):
+            # per_hop 按路径顺序保存每跳候选评分，例如 [[{'cores': (2,), 'noise': 1e-12, 'neighbors': 0}]]。
+            per_hop = []
+            # a/b 为当前跳节点，例如 0/1；group 为一整个备选芯组，例如 (2, 3, 4)。
+            for a, b in zip(path, path[1:]):
+                # candidates 为本跳本频点可用组的评分列表；元素 candidate 为其中一个评分字典。
+                candidates = [self._candidate(a, b, group, wave, launch_power, resources, powers, distances[a, b], quantum_scorer)
+                              for group in (self.forward_groups if a < b else self.backward_groups)
+                              if self._available(a, b, group, wave, resources)]
+                if not candidates:
+                    break
+                per_hop.append(candidates)
+            if len(per_hop) != len(path) - 1:
                 continue
-            if policy is None:
-                return groups, wave
-            candidates = [policy._candidate(a, b, c, wave, launch_power, resources, powers, distances[a, b])
-                          for a, b, cores in zip(path, path[1:], groups) for c in cores]
-            noise = sum(c['noise'] for c in candidates)
-            neighbors = sum(policy._same_direction_count(a, b, c, wave, resources)
-                            for a, b, cores in zip(path, path[1:], groups) for c in cores)
-            options.append((neighbors, noise, wave))
+            # chosen 为逐跳最低噪声候选列表；hop 为一跳的候选列表，例如 per_hop[0]。
+            chosen = [min(hop, key=lambda candidate: (
+                candidate['noise'], candidate['neighbors'], candidate['cores'])) for hop in per_hop]
+            options.append(dict(wave=wave, chosen=chosen, per_hop=per_hop))
         if not options:
             return None, -1
-        minimum = min(noise for _, noise, _ in options)
-        limit = minimum + policy.noise_rtol * abs(minimum)
-        _, _, wave = min(option for option in options if option[1] <= limit)
-        return groups, wave
 
-    def _first_fit(self, path, resources):
-        """FF/CCA/CQLI 先按实际频率从低到高，再选择本跳第一个可用芯。
+        # option 为一个可贯通信道的记录，例如 options[0]。
+        # minimum/limit 为全路径最低增量及容许上限，例如 1e-12/1.1e-12 W；minimum=0 时无绝对容差。
+        minimum = min(sum(candidate['noise'] for candidate in option['chosen']) for option in options)
+        limit = minimum + noise_rtol * abs(minimum)
+        # ranked 保存最终排序键和分配，例如 [((0, 1e-12, 3, ((2,),)), [(2,)], 3)]。
+        ranked = []
+        for option in options:
+            # original 是此信道的逐跳最低噪声选择，例如 option['chosen']，用于超限回退。
+            original = option['chosen']
+            if sum(candidate['noise'] for candidate in original) > limit:
+                continue
+            wave = option['wave']
+            chosen = []
+            for hop in option['per_hop']:
+                # local_min/local_limit 为当前跳的最低增量及容许上限，例如 5e-13/5.5e-13 W。
+                local_min = min(candidate['noise'] for candidate in hop)
+                local_limit = local_min + noise_rtol * abs(local_min)
+                # near 为局部容差内候选，例如 [hop[0], hop[2]]，优先选邻芯占用更少的组。
+                near = [candidate for candidate in hop if candidate['noise'] <= local_limit]
+                chosen.append(min(near, key=lambda candidate: (
+                    candidate['neighbors'], candidate['noise'], candidate['cores'])))
+            # 局部贪心若超出全路径上限则回退；不穷举组组合，也不约束整体秘密密钥率损失。
+            if sum(candidate['noise'] for candidate in chosen) > limit:
+                chosen = original
+            # neighbor_count 为各跳邻芯占用总数，例如 2；chosen_groups 为逐跳芯组，例如 [(2,), (1,)]。
+            neighbor_count = sum(candidate['neighbors'] for candidate in chosen)
+            chosen_groups = [candidate['cores'] for candidate in chosen]
+            # key 按邻芯数、噪声、原信道索引、芯编号排序，例如 (2, 1e-12, 3, ((2,), (1,)))。
+            key = (neighbor_count, sum(candidate['noise'] for candidate in chosen), wave, tuple(chosen_groups))
+            ranked.append((key, chosen_groups, wave))
+        # item 是 ranked 中的一条记录，例如 (key, chosen_groups, wave)；丢弃返回记录中的排序键。
+        _, chosen_groups, wave = min(ranked, key=lambda item: item[0])
+        return chosen_groups, wave
 
-        三者复用 first-fit 搜索；每跳按节点号选择前向或后向列表。
-        FF 按芯编号升序搜索，七芯两方向均为 [0,1,2,3,4,5]；即使传入列表乱序也排序。
-        CCA/CQLI 保留列表顺序，默认 CCA 两方向均为 [1,2,3,4,5,6]。
-        FF/CCA 还要求反向同芯同频未被经典业务占用；CQLI 只检查本方向。
-        同频按原索引破同分；没有共同可用频点或不足两节点时返回 (None,-1)。
-        """
-        if len(path) < 2:
-            return None, -1
-        for wave in sorted(range(resources.shape[-1]), key=lambda w: (self.frequencies[w], w)):
-            cores = []
+    def _frequency_order(self, resources):
+        """resources 为状态数组（同 allocate）；返回按实际频率升序排列的原索引，例如 [3, 2, 1, 0]。"""
+        # wave 为原信道索引，例如 3；同频时按该索引升序破同分。
+        return sorted(range(resources.shape[-1]), key=lambda wave: (self.frequencies[wave], wave))
+
+    def _first_fit(self, path, resources, *, sort_groups):
+        """按低频优先寻找全路径首个可用共同信道，返回逐跳芯组；失败返回 (None, -1)。"""
+        # path/resources 同 allocate；sort_groups=True 按芯编号排序候选组。
+        # wave 为原信道索引，例如 3；chosen_groups 为当前已选芯组，例如 [(0,), (2,)]。
+        for wave in self._frequency_order(resources):
+            chosen_groups = []
+            # a/b 为当前跳起止节点，例如 0/1；groups 为该方向候选，例如 ((0,), (2,))。
             for a, b in zip(path, path[1:]):
-                group = self.core_f if a < b else self.core_b
-                if self.algorithm == "FF":
-                    group = sorted(group)
-                core = next((c for c in group if resources[a, b, c, wave] == 1
-                             and (not self.reverse_exclusive or resources[b, a, c, wave] != 2)), None)
-                if core is None:
+                groups = self.forward_groups if a < b else self.backward_groups
+                if sort_groups:
+                    # group 是一组芯，例如 (2, 0)；按组内排序后的编号 (0, 2) 比较，输出保留原成员顺序。
+                    groups = sorted(groups, key=lambda group: tuple(sorted(group)))
+                # chosen 是首个全组可用的候选，例如 (0,)，不存在时为 None。
+                chosen = next((group for group in groups
+                               if self._available(a, b, group, wave, resources)), None)
+                if chosen is None:
                     break
-                cores.append(int(core))
-            if len(cores) == len(path) - 1:
-                return cores, wave
+                chosen_groups.append(chosen)
+            if len(chosen_groups) == len(path) - 1:
+                return chosen_groups, wave
         return None, -1
 
-    def _scwa(self, path, resources):
-        """SCWA 可变信道适配：奇偶偏好、按占用比例切换、全路径失败后回退。
+    def _available(self, a, b, group, wave, resources):
+        """判断本跳芯组在指定信道是否全部空闲，并检查反向同芯同频占用限制。"""
+        # a/b 如 0/1，group 如 (0,2)，wave 为信道索引；resources 同 allocate。
+        # core 为组内芯编号，例如 0；需要组内所有芯空闲，并按通用开关决定是否允许反向同芯同频同时占用。
+        return all(resources[a, b, core, wave] == 1
+                   and (self.allow_bidirectional or resources[b, a, core, wave] != 2)
+                   for core in group)
 
-        默认前向奇数芯 [4]、偶数芯 [3,5]；后向奇数芯 [6]、偶数芯 [0,2]。
-        奇偶序号按全部实际频率升序从 0 编起；同频用原索引破同分。
-        对每跳的原首选奇偶集合，仅状态 1/2 算有效经典位置、仅状态 2 算占用。
-        占用比例达到 7/12（参考 16 信道名义阈值 14/24）时交换本跳偏好，
-        每次到达重新判断；没有有效首选位置时直接偏好互补集合。
-        例如 8 个总频点、1 个量子频点时，首选有效容量为 11，占用 7 个才切换，
-        不再因量子预留位置使第一条业务后就切换。比例推广并非原版固定余量 10。
+    def _candidate(self, a, b, group, wave, launch_power, resources, powers, distance, quantum_scorer):
+        """计算候选芯组新增量子噪声与同向同频邻芯占用数，返回评分字典。"""
+        # 输入同 allocate/_available；distance 单位 m，quantum_scorer 同 _qcnm。
+        # deltas 为组内各芯新增噪声（W），例如 [1e-12, 2e-12, 0]；core 是成员编号，例如 2。
+        deltas = [self._core_noise(a, b, core, wave, launch_power, resources, powers, distance, quantum_scorer) for core in group]
+        # neighbors 是同向同频最近邻占用总数，例如 2；同一邻芯若邻接多个成员，会分别计数。
+        neighbors = sum(self._same_direction_count(a, b, core, wave, resources, quantum_scorer) for core in group)
+        # 物理模型按经典芯相加；每芯均加载 launch_power，而不是用某一芯噪声乘组大小。
+        return dict(cores=group, noise=sum(deltas), neighbors=neighbors)
 
-        先只在各跳当前首选集合中按低频优先找共同频点；整条路径失败后，重新
-        按低频优先搜索全部方向芯。回退时每跳仍先尝试其当前首选芯，再尝试
-        互补芯，因此允许一条路径的不同跳采用不同集合，不因奇偶偏好单独阻塞。
-        同频同集合按方向芯列表顺序选择。不计算噪声，不修改资源；不足两节点
-        或所有方向芯都没有全路径共同空闲频点时返回 (None,-1)。显式覆盖布局
-        时仍将各方向第一芯作为奇数芯，其余作为偶数芯，属于消融。
-        """
-        if len(path) < 2:
-            return None, -1
-        waves = sorted(range(resources.shape[-1]), key=lambda w: (self.frequencies[w], w))
-        parity = {wave: rank % 2 for rank, wave in enumerate(waves)}
-        hops = []
-        for a, b in zip(path, path[1:]):
-            group = self.core_f if a < b else self.core_b
-            preferred = [resources[a, b, core, wave]
-                         for index, core in enumerate(group) for wave in waves
-                         if parity[wave] == (1 if index == 0 else 0)]
-            capacity = sum(state in (1, 2) for state in preferred)
-            occupied = sum(state == 2 for state in preferred)
-            swapped = capacity == 0 or occupied * 12 >= capacity * 7
-            hops.append((a, b, group, swapped))
-        for allow_fallback in (False, True):
-            for wave in waves:
-                cores = []
-                for a, b, group, swapped in hops:
-                    core = next((c for index, c in enumerate(group)
-                                 if parity[wave] == ((1 if index == 0 else 0) ^ swapped)
-                                 and resources[a, b, c, wave] == 1), None)
-                    if core is None and allow_fallback:
-                        core = next((c for c in group if resources[a, b, c, wave] == 1), None)
-                    if core is None:
-                        break
-                    cores.append(core)
-                if len(cores) == len(path) - 1:
-                    return cores, wave
-        return None, -1
+    def _core_noise(self, a, b, core, wave, launch_power, resources, powers, distance, quantum_scorer):
+        """a/b/core/wave 是节点、单芯和信道编号（如 0/1/2/3）；其余参数同 _candidate，返回单芯新增量子噪声（W）。"""
+        # i/j 为从小到大排序的链路端点，例如反向 a/b=1/0 时 i/j=0/1，用于读取量子信道。
+        i, j = sorted((a, b))
+        # active 为该芯已占用信道的功率向量，例如 [0, 0.01, 0] W；trial 为加入业务后的功率副本。
+        active = np.where(resources[a, b, core] == 2, powers[a, b, core], 0.0)
+        trial = active.copy()
+        trial[wave] = launch_power
+        # total_delta 汇总全部量子芯和频点的噪声增量，例如 1e-12 W；没有量子频点时为零。
+        total_delta = 0.0
+        # qc 是量子芯编号，例如 6；qi 是该芯量子信道索引元组，例如 (0,)，index 为其中的原索引，如 0。
+        for qc in np.flatnonzero(np.any(resources[i, j] == 3, axis=1)):
+            qi = tuple(int(index) for index in np.flatnonzero(resources[i, j, qc] == 3))
+            # before_r/before_f 为新增前各量子频点的拉曼/四波混频功率数组，如 [1e-12]/[2e-13] W。
+            before_r, before_f = quantum_scorer.core_components(qc, core, a > b, active, qi, distance)
+            # after_r/after_f 为新增后对应数组，如 [1.2e-12]/[3e-13] W；a>b 表示相对量子光反向传播。
+            after_r, after_f = quantum_scorer.core_components(qc, core, a > b, trial, qi, distance)
+            total_delta += float(np.sum(after_r - before_r) + np.sum(after_f - before_f))
+        return total_delta
+
+    def _same_direction_count(self, a, b, core, wave, resources, quantum_scorer):
+        """a/b/core/wave 是节点、芯和信道编号（如 0/1/2/3），resources 同 allocate，quantum_scorer 同 _qcnm；返回邻芯占用数，例如 2。"""
+        # quantum_scorer.first[core] 是最近邻芯编号列表，例如 [1,3,6]；neighbor 为其中一个编号，例如 1。
+        return sum(int(resources[a, b, neighbor, wave] == 2)
+                   for neighbor in quantum_scorer.first[core])

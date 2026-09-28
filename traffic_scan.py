@@ -1,24 +1,5 @@
-"""组织负载/功率/距离实验、记录时隙末指标并汇总多个随机种子的结果。
-
-由 main.py --scan-load/--scan-power/--scan-distance/--scan-all 或 --export-business 调用，不能单独启动实验。
-输入为命令行参数和创建仿真实例的函数；事件始终由 sim.iter_slots 推进，
-本模块不另造业务或占用资源。完成的统计交给 traffic_export 写 JSON、Excel 和图。
-
-负载 A=到达率*平均保持时间，单位 Erlang，表示全网络输入负载而非每链路负载。
-普通负载/功率/距离扫描按单芯业务计数；仅 --export-business 按三芯业务组计数。
-默认 topology7 为两节点链路，边长直接读取拓扑文件，负载是两个方向的合计，方向独立等概率抽取。
-普通负载扫描默认30 Erlang，普通功率/距离扫描固定负载默认10 Erlang；
-三芯导出负载扫描默认5至40、步长5 Erlang业务组，功率扫描固定10业务组。
-保持时间均默认4。
-扫描用 A/holding_time 设置到达率，不使用 --arrival-rate。
-统计窗口为 [warmup, slots)，slots 包含预热；每个预热后的时隙末采样一次。
-SKR（秘密密钥率）采用双诱骗态有限样本估算，各量子信道先截零，再对选中链路
-量子信道和窗口时隙平均，单位bit/s；raw_skr仅作截零前差值诊断。
-每个资源快照使用固定脉冲块，块长不由时隙数推算。单次运行也复用此统计。
-
-同一场景、负载和种子的算法使用相同到达序列，并比较序列摘要确认一致；
-多跳网络仍可能因资源位置不同得到不同阻塞率。统计和绘图不保证算法达到某个增益。
-"""
+"""由 main.py 的扫描或业务导出入口调用，按给定参数与实例工厂编排实验。
+复用实例事件循环采样并汇总各随机种子，结果交给 traffic_export 写文件。"""
 from argparse import Namespace
 from dataclasses import asdict
 from datetime import datetime
@@ -32,7 +13,6 @@ import time
 import numpy as np
 import pandas as pd
 
-from algorithm import ALGORITHMS
 from noise_calculation import raman_model_config
 from skr_calculation import skr_model_config, synergy_skr_bounds
 from synergistic_calculation import osnr_db, add_paired_synergy, METRIC_DEFINITIONS
@@ -49,32 +29,15 @@ GROUP = ["scenario", "offered_load_erlang", "algorithm"]
 
 
 def measure_run(sim, warmup, event_recorder=None):
-    """运行一个全新实例，返回 (本种子指标字典, 时隙末样本列表)。
-    
-    到达/接入/阻塞数仅计入窗口内的到达，阻塞率=阻塞数/到达数；没有到达时
-    为 None，不能解释为零。承载负载是已接入业务持续时间与窗口的交集之和
-    除以窗口长度，包含预热期间到达但仍活跃的业务。每条业务按实际占用的芯数逐跳累计
-    占用时间（普通仿真每跳一芯，实验业务组每跳三芯），再除以窗口长度和初始
-    可用经典资源数得到 channel_utilization。
-    
-    active_services 是全网当时活跃业务数（实验为组数）；occupied_channels 只按观测
-    链路的芯和信道逐格计数，三芯组在该链路占三格。capacity 按全网可同时占用的物理格计数：
-    FF/CCA 两方向开放的同芯同频互斥，因此共享格只计一次；其余模式按方向计数。
-    零SKR比例只计算所选链路。可用SKR按有限样本模型逐信道截零后平均；
-    raw_skr为单独诊断列，不参与增益、协同度或正式SKR曲线。
-    OSNR 按参考业务入口公式的单链路版本，在每个非空时隙求平均接收信号
-    除以（平均串扰+固定噪声底），再在线性域按时隙等权平均，最后转 dB。
-    空闲不参与 OSNR 平均；有占用但零串扰仍因噪声底而有限。
-    经典功率/噪声及占用数只统计所选链路；active_services、阻塞率、承载量、
-    channel_utilization 保持全网业务口径，不能解释成单链路业务统计。
-    相同到达序列不等于逐个比较相同已接入业务。
-    QCNM 直接比较总噪声，不再统计安全等级或回退率。可选 recorder 记录全部资源变化。
-    """
+    """运行全新实例 sim，返回本种子指标字典及预热后时隙末样本。
+可选 event_recorder 接收全部资源变化，warmup 使用仿真时间单位。"""
     if not 0 <= warmup < sim.Ts:
         raise ValueError("warmup 必须满足 0 <= warmup < slots")
+    # 观测窗口为 [warmup, sim.Ts)，总时隙包含预热；例如 warmup=10、Ts=30。
     links = sorted((min(a, b), max(a, b)) for a, b in sim.graph.edges)
     capacity = int(np.count_nonzero(sim.m_resourceMap == 1))
-    if sim.allocator.reverse_exclusive:
+    # 禁止双向同芯同频时，共享资源格仅计一次；容量与利用率均按全网统计。
+    if not sim.allow_bidirectional:
         capacity -= sum(int(np.count_nonzero((sim.m_resourceMap[a, b] == 1)
                                             & (sim.m_resourceMap[b, a] == 1)))
                         for a, b in links)
@@ -85,6 +48,7 @@ def measure_run(sim, warmup, event_recorder=None):
     started = time.perf_counter()
 
     def observe_event(event, *, blocked):
+        """记录到达序列摘要、窗口计数及占用时长；blocked 表示本次到达是否被阻塞。"""
         nonlocal offered, blocked_count, active, carried_time, occupied_time
         arrival = bool(event.m_eventType['Arrival'])
         measured = event.m_time >= warmup
@@ -99,13 +63,16 @@ def measure_run(sim, warmup, event_recorder=None):
                 blocked_count += int(blocked)
             if not blocked:
                 active += 1
+                # 已接入业务与窗口求交，包含预热期间到达但在窗口内仍活跃的业务。
                 duration = max(0.0, min(sim.Ts, event.m_time + event.m_holdTime)
                                - max(warmup, event.m_time))
                 carried_time += duration
+                # 逐跳累加实际占用芯数：单芯业务每跳一芯，三芯业务每跳三芯。
                 occupied_time += duration * sum(np.size(cores) for cores in event.m_ocuppiedcore)
         else:
             active -= 1
 
+    # 每个预热后时隙末采样；不另造事件循环或修改资源。
     for slot in sim.iter_slots(on_event=observe_event):
         if slot < warmup:
             continue
@@ -119,6 +86,7 @@ def measure_run(sim, warmup, event_recorder=None):
                 totals[key] += metrics[key]
             quantum_count += metrics['quantum_channels']
             zero_count += metrics['zero_skr_channels']
+        # 秘密密钥率（SKR，bit/s）已逐量子信道截零；raw_skr 仅作诊断，不用于增益或协同度。
         for key in ('skr', 'raw_skr', 'no_fwm_skr', 'zero_noise_skr'):
             totals[key] /= quantum_count
         totals.update(time=slot + 1, active_services=active,
@@ -126,9 +94,11 @@ def measure_run(sim, warmup, event_recorder=None):
                       zero_skr_fraction=zero_count / quantum_count)
         if not all(math.isfinite(value) for value in totals.values()):
             raise ValueError("Non-finite simulation metric")
+        # 光信噪比（OSNR）只测所选链路：平均接收信号 /（平均串扰 + 固定噪声底）。
         totals['osnr_linear'] = sim.measure_classical_osnr()
         classical = sim.classical_osnr_scorer.statistics
         totals['zero_xt_channels'] = classical['zero_noise_channels']
+        # occupied_channels 只数观测链路资源格，active_services 则是全网业务数。
         totals['occupied_channels'] = classical['occupied_channels']
         totals['classical_received_power_w'] = classical['signal_sum_w']
         totals['classical_noise_power_w'] = classical['noise_sum_w']
@@ -138,7 +108,7 @@ def measure_run(sim, warmup, event_recorder=None):
         totals['classical_floor_w'] = classical['floor_sum_w']
         samples.append(totals)
     accepted = offered - blocked_count
-    # 空时隙不参与 OSNR 比值平均；SKR 包含空闲时隙。
+    # 非空时隙的 OSNR 在线性域等权平均后转 dB；SKR 包含空闲时隙，静态脉冲块不随时隙换算。
     row = {}
     for key in METRICS:
         values = [s[key] for s in samples if s[key] is not None]
@@ -155,6 +125,7 @@ def measure_run(sim, warmup, event_recorder=None):
         len(set(sim.classical_forward_cores) | set(sim.classical_backward_cores)),
         sim.launch_power, np.asarray(sim.available_channel)[quantum_indices],
         sim.bb84_params, sim.detector_params, sim.noise_model.first_fiber))
+    # 无到达时阻塞率未定义；承载量按窗口时长归一，利用率还需除以全网物理容量。
     row.update(offered=offered, accepted=accepted, blocked=blocked_count,
                blocking_rate=blocked_count / offered if offered else None,
                carried_load_erlang=carried_time / (sim.Ts - warmup),
@@ -165,17 +136,7 @@ def measure_run(sim, warmup, event_recorder=None):
 
 
 def summarize(runs):
-    """按场景、负载、算法分组，各独立种子的均值等权平均。
-
-    OSNR/协同度任一种子未定义时整体留空，不以剩余种子代替完整种子组。
-    
-    _sd 是种子均值之间的样本标准差，不是置信区间；仅一个有效种子时为 None。
-    synergy_vs_FF 是同工况同种子先配对计算、再跨种子等权平均的有符号协同度；
-    delta_osnr_linear_vs_FF 和 delta_skr_vs_FF 保留方向，避免乘积为零掩盖退化。
-    osnr_db_mean 为各种子 dB 均值的平均，不等于跨种子线性均值再转 dB。
-    增益=算法跨种子平均 SKR/基准跨种子平均 SKR-1，不是各种子增益的平均。
-    基准 FF/SCWA 未运行或均值非正时不计算增益，None 在 Excel 中显示为空白。
-    """
+    """按场景、负载和算法分组，等权汇总各独立种子的指标及样本标准差。"""
     frame = pd.DataFrame(runs)
     statistics = [f"{key}_mean" for key in METRICS] + [
         "blocking_rate", "carried_load_erlang", "channel_utilization",
@@ -188,14 +149,18 @@ def summarize(runs):
         row['qcnm_noise_rtol'] = float(rtol) if pd.notna(rtol) else None
         row.update(observed_link=group.iloc[0]['observed_link'], observed_length_m=group.iloc[0]['observed_length_m'], seed_count=len(group), arrival_rate=group.iloc[0]['arrival_rate'],
                    length_km=group.iloc[0]['length_km'], power_dbm=float(group.iloc[0]['power_dbm']))
+        # 各种子等权，dB 指标直接平均种子 dB 值；协同度已在同种子内相对 FF 配对计算。
         for key in statistics:
             values = group[key].dropna()
+            # OSNR/协同度任一种子缺失时整组留空，不用剩余种子代替。
             if key in ('osnr_linear_mean', 'osnr_db_mean', 'synergy_vs_FF',
                        'delta_osnr_linear_vs_FF') and len(values) != len(group):
                 values = values.iloc[:0]
             row[key] = float(values.mean()) if len(values) else None
+            # _sd 为种子均值间的样本标准差，不是置信区间；单种子留空。
             row[key + '_sd'] = float(values.std(ddof=1)) if len(values) > 1 else None
         rows.append(row)
+    # 增益是跨种子平均 SKR 的比值减一；缺基准或基准非正时留空。
     lookup = {(r['scenario'], r['offered_load_erlang'], r['algorithm']): r for r in rows}
     for row in rows:
         for baseline in ('FF', 'SCWA'):
@@ -216,13 +181,8 @@ def source_hashes(base, topology):
 
 
 def scan_settings(args):
-    """解析并校验扫描点，返回 (升序负载列表, 种子列表, 预热时长, 场景列表)。
-    
-    场景为 (全边覆盖长度km, 每经典信道功率dBm)；长度 None 表示不覆盖全网边长，
-    默认由 build_simulation 直接读取拓扑文件中的各边长度；显式观测长度另行覆盖。
-    --scan-scenarios 将长度和功率逐项配对，不取所有交叉组合；负载与种子不能重复。
-    scan_axis 为 power/distance 时场景按该物理量升序排列，负载固定为 fixed_load。
-    """
+    """校验命令行扫描参数，返回升序负载、种子、预热时长和场景列表。"""
+    # 普通扫描负载以 Erlang 计：负载轴默认 30，功率/距离轴固定负载默认 10。
     axis = getattr(args, 'scan_axis', 'load')
     loads = (args.loads if args.loads is not None else [30]) if axis == 'load' else [
         10 if args.fixed_load is None else args.fixed_load]
@@ -236,6 +196,7 @@ def scan_settings(args):
         raise ValueError('holding-time 必须为有限正数')
     if not 0 <= warmup < args.slots:
         raise ValueError('必须满足 0 <= warmup < slots')
+    # 场景为 (全边长度 km, 每芯每信道功率 dBm)，如 (10, 10.5)；长度 None 保留拓扑边长。
     scenarios = []
     if axis == 'power':
         powers = args.powers if args.powers is not None else [7, 8, 9, 10, 10.5]
@@ -243,6 +204,7 @@ def scan_settings(args):
     elif axis == 'distance':
         distances = args.distances if args.distances is not None else [1, 5, 10, 20, 30, 40, 50]
         scenarios = [(length, args.launch_power_dbm) for length in sorted(distances)]
+    # 显式场景逐项配对长度和功率，不取笛卡尔积。
     elif args.scan_scenarios:
         if args.link_length_km is not None:
             raise ValueError('--scan-scenarios 与 --link-length-km 不能同时使用')
@@ -264,25 +226,20 @@ def scan_settings(args):
     return sorted(loads), seeds, warmup, scenarios
 
 
-def run_traffic_scans(args, build_simulation, base):
-    """一次运行所选维度的独立扫描，不取负载×功率×距离的笛卡尔积。
-
-    负载组使用 loads；功率、距离组固定为 fixed_load（默认10 Erlang）。
-    功率组使用 powers/dBm，距离组使用 distances/km；距离组全边等长，
-    其余组使用拓扑距离或 link_length_km。负载和距离组固定 launch_power_dbm。
-    距离组禁止单边长度覆盖，防止横轴变化而观测距离不变。
-    多组结果分别写入同一批次的 load_scan/power_scan/distance_scan，单组保持原目录结构。
-    先校验全部扫描参数，再运行；每组仍复用唯一事件循环和原统计/导出逻辑。
-    """
+def run_traffic_scans(args, build_simulation, base, *, variants):
+    """按所选维度分别运行扫描，返回各组结果；多组输出分别放入对应子目录。"""
+    # 各轴独立运行，不取负载×功率×距离的笛卡尔积。
     axes = [axis for axis in ('load', 'power', 'distance') if getattr(args, 'scan_' + axis)]
     if args.scan_scenarios and axes != ['load']:
         raise ValueError('--scan-scenarios 仅用于单独负载扫描；多维扫描请指定 --powers/--distances')
+    # 距离扫描禁止单边覆盖，避免横轴变化却未改变观测距离。
     if 'distance' in axes and args.observe_link_length_km is not None:
         raise ValueError('距离扫描不能使用 --observe-link-length-km 覆盖扫描距离')
     output = Path(args.output_dir or base / 'results' / (
         'traffic_scan_' + datetime.now().strftime('%Y%m%d_%H%M%S_%f'))).resolve()
     if output.exists() and any(output.iterdir()):
         raise ValueError('扫描输出目录必须为空，请指定新的 --output-dir')
+    # 先校验全部扫描参数，再逐组运行，避免后一组参数错误留下半批输出。
     jobs = []
     for axis in axes:
         job = Namespace(**vars(args))
@@ -292,33 +249,9 @@ def run_traffic_scans(args, build_simulation, base):
         jobs.append(job)
     results = {}
     for job in jobs:
-        results[job.scan_axis] = run_load_scan(job, build_simulation, base)
+        results[job.scan_axis] = run_load_scan(job, build_simulation, base, variants=variants)
     return results
 
-
-
-def comparison_plan(args, default=('QCNM', 'CCA', 'FF'), *, three_core=False):
-    """返回算法与容差的运行组合；label 区分曲线，algorithm 用于实际分配。
-
-    扫描/导出默认六个 QCNM 容差加 CCA、FF。显式多选仅导出所选项；
-    缺少 FF 时补跑内部基准以计算协同度和四个比值，但不把它绘成比较曲线。
-    三芯模式保留原有 FF/CCA/QCNM 限制，ALL 只展开本模式支持的算法。
-    """
-    supported = ('FF', 'CCA', 'QCNM') if three_core else ALGORITHMS
-    selected = list(dict.fromkeys(args.algorithm or default))
-    if selected == ['ALL']:
-        selected = list(supported)
-    if any(name not in supported for name in selected):
-        raise ValueError('三芯实验仅支持 FF、CCA、QCNM；CQLI/SCWA 请使用普通扫描')
-    variants = []
-    for name in selected:
-        for rtol in args.qcnm_noise_rtol if name == 'QCNM' else [None]:
-            variants.append(dict(algorithm=name,
-                label=f'QCNM(rtol={rtol!r})' if name == 'QCNM' else name,
-                qcnm_noise_rtol=rtol, export=True))
-    if 'FF' not in selected:
-        variants.append(dict(algorithm='FF', label='FF', qcnm_noise_rtol=None, export=False))
-    return variants
 
 
 def select_comparison_rows(rows, variants, keys):
@@ -335,37 +268,30 @@ def select_comparison_rows(rows, variants, keys):
     return result
 
 
-def run_load_scan(args, build_simulation, base):
-    """运行场景×负载×种子×算法的组合，通过相同业务序列公平比较算法。
-    
-    默认比较六个 QCNM 容差、CCA、FF；ALL 运行五种算法并展开 QCNM 容差。
-    显式多选只导出所选项，缺少 FF 时内部补跑基准。返回含 config/summary/runs/samples 的字典，JSON 始终
-    保存逐时隙样本；--save-samples 仅兼容旧命令，Excel 始终只输出简表。
-    参数、物理配置及本次依赖版本随结果保存；输出位置由 args.output_dir 决定。
-    """
+def run_load_scan(args, build_simulation, base, *, variants):
+    """遍历主控传入的场景、负载、种子与算法组合，返回含配置、汇总、单次指标和样本的字典。"""
     loads, seeds, warmup, scenarios = scan_settings(args)
     # 先检查导出依赖，避免长时间仿真完成后才发现无法生成图表。
     import openpyxl  # noqa: F401
     import matplotlib  # noqa: F401
-    variants = comparison_plan(args)
     algorithms = [v['label'] for v in variants if v['export']]
     output = args.output_dir or base / 'results' / ('traffic_scan_' + datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     if any(output.glob('traffic_scan*')) or any(output.glob('traffic_diagnostics*')):
         raise ValueError('输出目录已有业务扫描结果，请指定新的 --output-dir')
-    metadata = dict(scan_axis=getattr(args, 'scan_axis', 'load'), topology=args.topology, loads_erlang=loads, seeds=seeds, slots=args.slots,
+    metadata = dict(allow_bidirectional=args.allow_bidirectional, scan_axis=getattr(args, 'scan_axis', 'load'), topology=args.topology, loads_erlang=loads, seeds=seeds, slots=args.slots,
                     warmup=warmup, holding_time=args.holding_time, algorithms=algorithms,
                     scenarios=scenarios, k=args.k, skip_c33=not args.include_c33,
                     classical_channels=args.classical_channels, quantum_channels=args.quantum_channels,
-                    core_layout=args.core_layout or 'algorithm default',
+                    core_layout='fixed seven-core algorithm layout',
                     qcnm_noise_rtols=args.qcnm_noise_rtol,
                     comparison_variants=variants,
                     qcnm_objective='Require N <= Nmin + rtol*abs(Nmin) for incremental Raman + FWM power at quantum receivers (W); then minimize occupied co-directional same-frequency first-neighbor count, noise, and channel index',
                     qcnm_frequency_preference='Disabled: replaced by co-directional same-frequency nearest-neighbor occupancy count',
                     qcnm_neighbor_objective='Count occupied co-directional same-frequency classical channels on first neighbors; no secondary neighbors, opposite direction, power weights or XT calculation',
-                    scwa_rule='Adaptive SCWA, not exact reference: ascending actual frequency ranks including quantum frequencies; first core per direction prefers odd ranks, others even; swap preference at 7/12 occupancy of eligible preferred classical cells (states 1/2 only); search preferred sets across the whole path first, then all directional cores with per-hop preference; no parity-only blocking',
-                    scwa_version='eligible_occupancy_7_12_with_path_fallback_v1',
+                    scwa_rule='Reference seven-core groups: forward odd [4], even [3,5]; backward odd [6], even [0,2]. Odd/even lists use original channel indices and actual channel count. Count every state != 1 in the original parity cells; swap when count >= nominal capacity - 10. Search original indices in ascending order, with no fallback',
+                    scwa_version='reference_seven_core_fixed_reserve_10_no_fallback_v2',
                     allocation_mode='single_core_per_hop', three_core_binding=False,
                     load_definition='A = arrival_rate * holding_time; network-wide offered traffic',
                     observation_window=f'[{warmup}, {args.slots}) time units',
@@ -387,6 +313,7 @@ def run_load_scan(args, build_simulation, base):
         classical_xt_w='W', classical_floor_w='W',
         synergy_vs_FF='dimensionless')
     metadata['source_sha256'] = source_hashes(base, args.topology)
+    # variants 已由主控展开容差并补 FF 内部基准；这里只运行指定组合，按 export 标记筛选输出。
     runs, samples, configurations = [], [], {}
     # 跨扫描点也比较输入业务摘要；距离改变路由时，仍只要求到达业务一致。
     traffic_hashes = {}
@@ -400,13 +327,14 @@ def run_load_scan(args, build_simulation, base):
                 for variant in variants:
                     algorithm = variant["algorithm"]
                     label = variant["label"]
+                    # 负载 A=到达率×平均保持时间，扫描由 A 反推到达率，不采用普通运行的 arrival-rate。
                     sim = build_simulation(base / 'topologies' / f'{args.topology}.json',
                         algorithm=algorithm, slots=args.slots, arrival_rate=load / args.holding_time,
                         holding_time=args.holding_time, k=args.k, seed=seed,
                         classical_channels=args.classical_channels, quantum_channels=args.quantum_channels,
                         launch_power=1e-3 * 10 ** (power / 10), link_length_km=length,
-                        core_layout=None if algorithm == "FF" else args.core_layout, skip_c33=not args.include_c33,
-                        qcnm_noise_rtol=variant["qcnm_noise_rtol"] or 0.0, observe_link=args.observe_link,
+                        skip_c33=not args.include_c33,
+                        allow_bidirectional=args.allow_bidirectional, qcnm_noise_rtol=variant["qcnm_noise_rtol"] or 0.0, observe_link=args.observe_link,
                         observe_link_length_km=args.observe_link_length_km,
                         key_pulses=args.key_pulses, key_gamma=args.key_gamma)
                     metadata.setdefault('skr_model', skr_model_config(sim.bb84_params, sim.detector_params))
@@ -427,6 +355,7 @@ def run_load_scan(args, build_simulation, base):
                                   seed=seed, length_km=length, power_dbm=power,
                                   arrival_rate=load / args.holding_time)
                     row, trace = measure_run(sim, warmup)
+                    # 校验输入到达序列相同，不意味着不同算法接入了相同业务。
                     if reference_hash is not None and row['traffic_sha256'] != reference_hash:
                         raise ValueError('Paired algorithms received different traffic traces')
                     reference_hash = row['traffic_sha256']
@@ -444,6 +373,7 @@ def run_load_scan(args, build_simulation, base):
     summary = select_comparison_rows(summary, variants, ('scenario', 'offered_load_erlang'))
     runs = select_comparison_rows(runs, variants, ('scenario', 'offered_load_erlang', 'seed'))
     samples = [row for row in samples if row['algorithm'] in algorithms]
+    # JSON 始终保留逐时隙样本；save_samples 仅兼容旧参数，Excel 仅输出汇总简表。
     data = dict(config=metadata, summary=summary, runs=runs, samples=samples)
     figures = export_scan_results(output, data, args.save_samples)
     print(f"扫描完成：{output}\nExcel: traffic_scan.xlsx\nJSON: traffic_scan.json\n图: {', '.join(figures)}")
@@ -451,11 +381,7 @@ def run_load_scan(args, build_simulation, base):
 
 
 def summarize_business(runs):
-    """按扫描组、工况、算法容差分别汇总，种子等权；SKR 为 bit/s。
-
-    采用长表，每个 QCNM 容差独占一行，不把六个容差误当作六个随机种子。
-    任一种子的 OSNR/协同度未定义时，该工况汇总也留空；单种子标准差为空。
-    """
+    """按扫描组、工况和算法容差等权汇总种子结果，每个容差单独占一行。"""
     frame = pd.DataFrame(runs)
     result = {'load_scan': [], 'power_scan': []}
     metrics = ('skr_mean', 'osnr_linear_mean', 'osnr_db_mean', 'blocking_rate',
@@ -469,6 +395,7 @@ def summarize_business(runs):
                    qcnm_noise_rtol=float(rtol) if pd.notna(rtol) else None)
         for metric in metrics:
             values = data[metric].dropna()
+            # 任一种子 OSNR/协同度缺失时整组留空；标准差仍按独立种子计算。
             if metric in ('osnr_linear_mean', 'osnr_db_mean', 'synergy_vs_FF',
                           'delta_osnr_linear_vs_FF') and len(values) != len(data):
                 values = values.iloc[:0]
@@ -478,26 +405,9 @@ def summarize_business(runs):
     return result
 
 
-def run_business_export(args, build_simulation, base):
-    """运行全网三芯业务并导出所选链路，返回批次索引并输出资源状态回放。
-    
-    ALL 在本模式运行 FF、CCA 与 QCNM；固定 C35 量子信道和跳过 C33
-    的经典候选，数量由 --classical-channels 指定（默认10）。仅本入口开启三芯绑定；到达/阻塞/承载负载按业务组统计，
-    每芯每信道功率不变，普通运行与 --scan-load 仍按单芯业务运行。
-    默认在 topology7 的两节点链路随机生成双向业务，距离读取拓扑文件。
-    负载组默认5/10/15/20/25/30/35/40 Erlang业务组、固定10.5 dBm；功率组默认
-    7/8/9/10/10.5 dBm、固定10 Erlang，可用 loads/powers/fixed-load/fixed-power 修改。
-    负载均为两个方向的业务组合计；保持时间默认4，到达率为负载除以4。
-    每组占三芯；功率扫描固定10 Erlang时，到达率为2.5组/仿真时间。
-    显式 loads/fixed-load 已按三芯组计数，不再除以三，也不按阻塞率自动降载。
-    相同负载、种子在各算法和功率下必须有相同到达序列。交叉工况在两组各留一份。
-    
-    5% 阻塞率只保留为元数据中的人为实验目标，不在图中画参考线，也不是算法接入限制；
-    不保证默认工况或任意指定负载均低于此线。输出目录必须为空。
-    manifest.json 使用 schema_version=4，summary 为逐算法容差的长表，SKR 单位 bit/s。
-    索引最后生成，用作完成批次的标志；回放、图表和工作簿生成失败时
-    可能留有不完整文件，应换新目录重跑，不把目录存在视作成功。
-    """
+def run_business_export(args, build_simulation, base, *, variants):
+    """运行主控指定的三芯业务组合并导出所选链路回放，返回批次索引。
+负载按全网双向合计业务组计数，每芯每信道功率保持输入值。"""
     # 在仿真前检查工作簿和图表所需依赖。
     import openpyxl  # noqa: F401
     import matplotlib  # noqa: F401
@@ -506,11 +416,10 @@ def run_business_export(args, build_simulation, base):
         raise ValueError('--export-business 不与统计扫描模式同时使用')
     if args.classical_channels <= 0:
         raise ValueError('实验经典信道数必须为正整数')
+    # 三芯实验固定量子频率 193.5 THz（C35），排除经典频率 193.3 THz（C33）。
     if args.quantum_channels != 1 or args.include_c33:
         raise ValueError('实验业务导出使用 C35 量子信道，经典信道跳过 C33')
-    variants = comparison_plan(args, three_core=True)
-    if args.core_layout is not None:
-        raise ValueError('三芯实验保留各算法默认分组，不支持 --core-layout')
+    # 三芯组负载不除以三，也不为达到阻塞率目标自动降载；默认保持时间为 4。
     loads, seeds, warmup, _ = scan_settings(args)
     if args.loads is None:
         loads = [5, 10, 15, 20, 25, 30, 35, 40]
@@ -529,9 +438,10 @@ def run_business_export(args, build_simulation, base):
         raise ValueError('业务导出目录必须为空，避免覆盖实验依据')
     output.mkdir(parents=True, exist_ok=True)
     hashes = source_hashes(base, args.topology)
+    # 负载组与功率组独立扫描，交叉工况在两组各保留一份。
     experiments = [('load_scan', load, args.fixed_power) for load in loads]
     experiments += [('power_scan', fixed_load, power) for power in sorted(powers)]
-    metadata = dict(loads_erlang=loads, powers_dbm=sorted(powers), fixed_load_erlang=fixed_load,
+    metadata = dict(allow_bidirectional=args.allow_bidirectional, loads_erlang=loads, powers_dbm=sorted(powers), fixed_load_erlang=fixed_load,
                     classical_channels=args.classical_channels, quantum_channels=1,
                     fixed_power_dbm=args.fixed_power, seeds=seeds, slots=args.slots, warmup=warmup,
                     holding_time=args.holding_time, topology=args.topology, length_km=args.link_length_km, algorithms=algorithms,
@@ -551,6 +461,7 @@ def run_business_export(args, build_simulation, base):
                     default_load_scaling='Load scan defaults to 5,10,15,20,25,30,35,40 Erlang three-core groups; power scan defaults to 10; explicit group loads are not divided by three or reduced to meet a blocking target',
                     carried_load_definition='Integral of active accepted groups / observation duration',
                     resource_definition='capacity/utilization are network-wide; occupied_channels counts only the selected link; all count physical core-channel cells')
+    # 5% 仅是人为实验目标，不参与接入决策，也不保证任何给定工况达到该目标。
     metadata.update(blocking_rate_limit=.05,
                     blocking_definition='Blocked three-core group arrivals / offered group arrivals in [warmup, slots); not packet loss or BER',
                     blocking_limit_definition='User-selected experiment target, strictly below 5%; not an enforced admission rule or universal standard')
@@ -563,6 +474,7 @@ def run_business_export(args, build_simulation, base):
     manifest = dict(schema_version=4, kind='qkd_business_experiments',
                     description='Network allocation; selected-link replay and metrics; full warmup retained',
                     config=metadata, files=[])
+    # 三芯导出仅选择 CCA/QCNM；主控补跑的 FF 仅用于配对基准，不导出其回放或曲线。
     references, runs = {}, []
     for group, load, power in experiments:
         for seed in seeds:
@@ -574,8 +486,8 @@ def run_business_export(args, build_simulation, base):
                     holding_time=args.holding_time, k=args.k, seed=seed,
                     classical_channels=args.classical_channels, quantum_channels=1,
                     launch_power=1e-3 * 10 ** (power / 10), link_length_km=args.link_length_km,
-                    core_layout=args.core_layout, skip_c33=True,
-                    qcnm_noise_rtol=variant["qcnm_noise_rtol"] or 0.0, bind_three=True, observe_link=args.observe_link,
+                    skip_c33=True,
+                    allow_bidirectional=args.allow_bidirectional, qcnm_noise_rtol=variant["qcnm_noise_rtol"] or 0.0, bind_three=True, observe_link=args.observe_link,
                         observe_link_length_km=args.observe_link_length_km,
                         key_pulses=args.key_pulses, key_gamma=args.key_gamma)
                 metadata.setdefault('skr_model', skr_model_config(sim.bb84_params, sim.detector_params))
@@ -612,7 +524,7 @@ def run_business_export(args, build_simulation, base):
     artifacts = export_business_summary(output, runs, metadata, summary)
     manifest['artifacts'] = [dict(file=name, sha256=sha256((output / name).read_bytes()).hexdigest())
                              for name in artifacts]
-    # 最后写入批次索引，表示本批所有输出均已完成。
+    # 索引最后写入才表示批次完成；中途失败可能留下不完整文件，重跑应使用新目录。
     write_trace(output / 'manifest.json', manifest)
     print(f'业务导出完成：{output}', flush=True)
     return manifest

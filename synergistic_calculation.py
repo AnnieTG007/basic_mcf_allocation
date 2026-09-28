@@ -1,14 +1,5 @@
-"""基于 KeyConsumption_24node -7 core 幅值扩展的有符号协同度，由 main/traffic_scan 调用。
-
-输入为同链路同种子的时间平均线性 OSNR 和每量子信道非负有限样本 SKR（bit/s）。
-量子侧标尺由 skr_calculation 按本次距离与参数计算：上限为零外加噪声 SKR，
-下限为受到（经典纤芯数-1）个正向串扰源时的 SKR，单位 bit/s。
-经典侧使用本次每芯每信道发射功率、六个正向串扰源和固定噪声底的单跳 OSNR 标尺。
-幅值 M=sqrt(abs(Uc1-Uc2)*abs(Uq1-Uq2))；相对基准 OSNR 和 SKR 均严格提高时 S=+M，
-否则 S=-M。任一指标相等时幅值为零，返回 0；不截断，不保证绝对值 <=1。
-另存原始差值以区分单项退化和双项退化；标尺和指标有效时 FF 对自身为零。
-空闲窗口的 OSNR 未定义或 SKR 上下限相等时，协同度为 None。历史结果不改写。
-"""
+"""供 main/traffic_scan 调用，将同工况算法与 FF 基准的光信噪比（OSNR）和秘密密钥率（SKR）换算为有符号协同度。
+输入为线性 OSNR 与 bit/s 密钥率，返回无量纲指标或未定义值 None。"""
 import math
 from skr_calculation import SKR_DEFINITIONS
 
@@ -39,14 +30,8 @@ def osnr_db(linear):
 
 
 def calculate_synergistic(distance, osnr1, skr1, osnr2, skr2, *, power, skr_lower, skr_upper, reference_xt_power):
-    """距离 m、实际每芯每信道功率 power（W）、线性 OSNR、SKR 及上下限 bit/s。
-
-    reference_xt_power 为本次光纤模型计算的单个最近邻正向串扰源功率 W。
-    返回无量纲协同度或 None。指标/界缺失、非有限或量子侧跨度非正时返回 None；
-    有效指标下距离和功率必须为有限正数，否则抛错。两算法共用本次参数的标尺。
-    第一组为待评价算法，第二组为基准；仅 OSNR、SKR 都严格高于基准时取正幅值，
-    否则取负幅值。任一指标相等时返回 0；不对归一化值或最终协同度限幅。
-    """
+    """按共同物理标尺计算两算法的有符号协同度；指标缺失、非有限或量子标尺跨度非正时返回 None。"""
+    # distance 为 m、power 为每芯每信道 W、skr* 为 bit/s；第一组是待评价算法，第二组是基准。
     if any(v is None or not math.isfinite(v) for v in (osnr1, skr1, osnr2, skr2, skr_lower, skr_upper)):
         return None
     if not math.isfinite(distance) or distance <= 0:
@@ -55,25 +40,27 @@ def calculate_synergistic(distance, osnr1, skr1, osnr2, skr2, *, power, skr_lowe
         raise ValueError('Synergy power must be finite and positive')
     if skr_upper <= skr_lower:
         return None
+    # reference_xt_power 是单个正向邻芯串扰功率（W）；调用方须保证有限正值，以免经典标尺退化。
+    # 固定衰减为 0.2 dB/km，distance 从 m 换 km 后再由 dB 换为线性功率比。
     received = power * math.pow(10, -(distance * 0.2 * 1e-4))
+    # 经典标尺下限含六个串扰源，上限为零串扰；两者均保留 3.21e-9 W 固定噪声底。
     c_alpha = received / (6 * reference_xt_power + 3.21e-9)
     c_beta = received / 3.21e-9
+    # uc/uq 分别为经典/量子归一化指标，不截断到 [0,1]；量子上下限由调用方按实际距离计算。
     uc1, uc2 = (osnr1-c_alpha)/(c_beta-c_alpha), (osnr2-c_alpha)/(c_beta-c_alpha)
     span = skr_upper - skr_lower
     uq1, uq2 = (skr1-skr_lower)/span, (skr2-skr_lower)/span
+    # 沿用参考幅值：两侧归一化差绝对值的几何平均；任一指标相等则幅值为零。
     magnitude = math.sqrt(abs(uc1-uc2) * abs(uq1-uq2))
     if magnitude == 0:
         return 0.0
+    # 仅两指标相对基准都严格提高时取正；其余非零幅值取负，不限幅。
     return magnitude if osnr1 > osnr2 and skr1 > skr2 else -magnitude
 
 
 def add_paired_synergy(runs, keys, *, baseline='FF'):
-    """原地添加协同度及 SKR/OSNR 差值；缺基准/OSNR 或量子标尺重合时协同度留空。
-
-    keys 由调用方覆盖场景、负载、功率、种子等配对条件；每键应仅有一条基准记录。
-    另核对观测链路、距离、发射功率和上下限相同。baseline 允许 FF 的导出别名 first-fit，
-    结果字段仍统一为 *_vs_FF；OSNR 缺失时仍保留可计算的 SKR 差值。
-    """
+    """按 keys 指定的同工况条件配对基准，原地添加协同度及 SKR/OSNR 差值。"""
+    # keys 如场景、负载、功率与种子，每键应仅有一条基准；baseline 可指定 FF 的导出别名。
     references = {tuple(row[key] for key in keys): row for row in runs if row['algorithm'] == baseline}
     for row in runs:
         ref = references.get(tuple(row[key] for key in keys))
@@ -88,6 +75,7 @@ def add_paired_synergy(runs, keys, *, baseline='FF'):
             power=row['synergy_reference_launch_power_w'],
             skr_lower=row['synergy_skr_lower'], skr_upper=row['synergy_skr_upper'],
             reference_xt_power=row['synergy_reference_xt_power_w'])
+        # OSNR 缺失时仍保留可计算的 SKR 差值，避免协同度为空掩盖单侧变化。
         valid = ref is not None and row['osnr_linear_mean'] is not None and ref['osnr_linear_mean'] is not None
         row['delta_osnr_linear_vs_FF'] = row['osnr_linear_mean']-ref['osnr_linear_mean'] if valid else None
         row['delta_skr_vs_FF'] = row['skr_mean']-ref['skr_mean'] if ref is not None else None

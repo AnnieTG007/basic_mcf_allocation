@@ -1,9 +1,5 @@
-"""读取网络拓扑并按总边长寻找候选路径，由 main 构建仿真时调用。
-
-输入 JSON 中节点为连续零起始整数，边长 length_km 为 km；没有默认网络。
-load_topology 返回无向图，distance_matrix 返回直连距离数组，
-k_shortest_paths 返回 [(节点列表, 路径长度km), ...]，不连通时为空列表。
-"""
+"""由 main 导入调用，读取拓扑 JSON，生成直连距离矩阵和按总边长排序的候选路径。
+输入边长使用 km，节点编号从零连续递增，返回 NetworkX 图、数组或路径列表。"""
 import json
 from itertools import islice
 from pathlib import Path
@@ -29,12 +25,8 @@ def validate_graph(graph):
 
 
 def load_topology(path):
-    """读取 JSON 并返回 NetworkX 无向图，拒绝重复边及未声明的节点。
-    
-    最小示例：{"directed": false, "nodes": [0, 1],
-    "edges": [{"source": 0, "target": 1, "length_km": 10}]}。
-    可选 name 为拓扑名称；所有节点必须列出，编号从 0 连续递增。
-    """
+    """从 path 指定的 JSON 加载无向拓扑，拒绝重复边和未声明的节点。"""
+    # JSON 需含 directed=false、完整 nodes 列表及 edges；每边如 {source: 0, target: 1, length_km: 10}。
     with Path(path).open(encoding="utf-8") as stream:
         data = json.load(stream)
     if data.get("directed") is not False:
@@ -43,6 +35,7 @@ def load_topology(path):
     if any(type(n) is not int for n in nodes) or len(set(nodes)) != len(nodes):
         raise ValueError("Node IDs must be unique integers")
     graph = nx.Graph(name=data.get("name", Path(path).stem))
+    # 加载时固定节点和边的插入顺序，为等长候选提供可重复的输入。
     graph.add_nodes_from(sorted(nodes))
     for edge in sorted(data["edges"], key=lambda e: (e["source"], e["target"])):
         u, v = edge["source"], edge["target"]
@@ -60,6 +53,7 @@ def distance_matrix(graph, unit="km"):
     validate_graph(graph)
     if unit not in ("km", "m"):
         raise ValueError("unit must be 'km' or 'm'")
+    # unit 仅接受 km/m；例如 unit="m" 将文件中的 10 km 换为 10000 m。
     matrix = nx.to_numpy_array(graph, nodelist=range(len(graph)),
                                weight="length_km", nonedge=np.inf)
     np.fill_diagonal(matrix, 0.0)
@@ -67,17 +61,16 @@ def distance_matrix(graph, unit="km"):
 
 
 def k_shortest_paths(graph, source, target, k):
-    """返回 [(零起始节点路径, 距离km), ...]；不连通返回空列表。
-
-    距离相同的候选保留 NetworkX 的生成顺序，固定节点/边插入顺序。
-    不承诺复现旧 Kshort 对等长路径的次级排序。
-    """
+    """按总边长返回至多 k 条简单路径及距离（km），不连通时返回空列表。"""
+    # source/target 是节点编号，如 0/1；k 为路径数量上限，如 3。
     if isinstance(k, bool) or not isinstance(k, (int, np.integer)) or k < 1:
         raise ValueError("k must be a positive integer")
     if source not in graph or target not in graph:
         raise nx.NodeNotFound("Source or target is not in the graph")
     if source == target:
         return [([source], 0.0)]
+    # 等长路径沿用 NetworkX 的生成顺序；任意外部图的插入顺序由调用方保证。
+    # 单路径与多路径分支没有额外统一的同分排序，不承诺复现旧 Kshort 顺序。
     try:
         if k == 1:
             cost, path = nx.single_source_dijkstra(graph, source, target, weight="length_km")
