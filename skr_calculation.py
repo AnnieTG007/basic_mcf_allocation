@@ -165,7 +165,7 @@ def calculate_quantum_noise_components(quantum_core, classical_core, backward, p
                                        first_fiber, secondary_fiber):
     """返回一个经典芯贡献的 (Raman 功率数组, FWM 功率数组)，单位 W。
     只计两级邻芯；缓存数组不可原地修改，范围外返回零仅表示模型未计入。"""
-    # 两芯编号如 6/0；backward=True 为经典光相对量子光反向；powers 为有效功率谱 W。
+    # 两芯编号如 1/2；backward=True 为经典光相对量子光反向；powers 为有效功率谱 W。
     # quantum_indices 为目标信道索引，distance 为 m，frequencies 为 Hz；邻芯表和模型同 calculate_SKR_core。
     if classical_core in first_neighbors[quantum_core]:
         fiber = first_fiber
@@ -186,7 +186,7 @@ def calculate_quantum_metrics(forward_resources, backward_resources,
     """汇总一条链路当前状态的 SKR（bit/s）、噪声功率（W）、每门噪声计数及量子信道数量。
     SKR、功率和噪声计数均跨量子信道求和；正式 skr 逐信道截零，raw_skr 仅用于诊断。"""
     # 频率、邻芯表、物理模型及探测/BB84 参数同 calculate_SKR_core。
-    # 两方向 resources/powers 均为 [芯, 信道] 数组（如 (7, 16)），状态 0/1/2/3 为不可用/空闲经典/占用经典/量子保留，功率单位 W。
+    # 两方向 resources/powers 均为 [芯, 信道] 数组（如 (8, 16)，芯轴第 0 项留空），状态 0/1/2/3 为不可用/空闲经典/占用经典/量子保留，功率单位 W。
     # forward 为小节点到大节点的量子接收方向，backward 为反向经典光；distance 单位 m（如 1000）。
     frequencies = np.asarray(frequencies, dtype=float)
     result = dict(skr=0.0, raw_skr=0.0, no_fwm_skr=0.0, zero_noise_skr=0.0,

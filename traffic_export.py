@@ -4,9 +4,10 @@
 业务回放 JSON 只告诉实验端"哪些纤芯、某时刻占用哪些信道"，格式如下：
 
     {
-      "forward_cores": [1, 3, 5],
-      "backward_cores": [0, 2, 4],
-      "channels_hz": [193.5e12, ...],
+      "forward_cores": [3, 4, 5],
+      "backward_cores": [6, 7, 1],
+      "quantum_frequencies_hz": [193.5e12],
+      "classical_frequencies_hz": [194.0e12, 193.9e12, ...],
       "duration_s": 3600,
       "states": [
         {"time_s": 0, "forward_channels": [], "backward_channels": []},
@@ -14,7 +15,9 @@
       ]
     }
 
-约定：信道编号（channel）就是 channels_hz 中的下标，与仿真内部编号一致；前向指节点号由小到大。
+约定：占用信道编号从 0 开始，是 classical_frequencies_hz 的下标；前向指节点号由小到大。
+quantum_frequencies_hz 单独记录量子频率，经典候选列表保持仿真顺序，不按实际占用筛选。
+纤芯从 1 编号：中心为 1，外围从顶部顺时针为 2–7。
 forward_cores/backward_cores 给出本次仿真实际使用的方向纤芯，供实验端与自身设置核对是否一致。
 某一时刻未出现在列表里的信道即该时刻不应有波长。states 按事件发生顺序排列，同时刻事件保持原顺序。
 """
@@ -43,7 +46,7 @@ class TrafficRecorder:
         self.occupancy = [
             [[-1 if sim.m_resourceMap[a, b, c, w] == 1 else -2
               for w in range(sim.quantum_wave_num, sim.WaveNumber)]
-             for c in range(sim.core_num)] for a, b in self.links]
+             for c in range(sim.core_num + 1)] for a, b in self.links]
         # active 按业务编号保存已接入业务，供离去事件找回分配；trace 保存占用状态变化序列。
         self.active = {}
         self.trace = []
@@ -140,7 +143,8 @@ class TrafficRecorder:
             self.active.clear()
         return dict(forward_cores=list(self.sim.classical_forward_cores),
                     backward_cores=list(self.sim.classical_backward_cores),
-                    channels_hz=[float(f) for f in self.sim.available_channel],
+                    quantum_frequencies_hz=[float(f) for f in self.sim.available_channel[:self.sim.quantum_wave_num]],
+                    classical_frequencies_hz=[float(f) for f in self.sim.available_channel[self.sim.quantum_wave_num:]],
                     duration_s=float(self.sim.Ts),
                     states=self.trace)
 
@@ -319,7 +323,7 @@ def plot_scan(output, summary, scan_axis='load'):
 
 
 def export_business_summary(output, runs, metadata, summary):
-    """将业务汇总导出为 LoadSweep/PowerSweep 工作表及四指标的 PNG、SVG 图，返回文件名列表。"""
+    """将业务汇总导出为 LoadSweep/PowerSweep 工作表及四指标的 SVG 图，返回文件名列表。"""
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -341,11 +345,11 @@ def export_business_summary(output, runs, metadata, summary):
     note = (f"{runs[0]['observed_length_m'] / 1000:g} km bidirectional | slots={metadata['slots']}, warmup={metadata['warmup']} | "
             f"{len(metadata['seeds'])} seed(s); " +
             ('error bars: across-seed SD' if len(metadata['seeds']) > 1 else 'single-seed trend'))
-    metrics = [('osnr_db_mean', 'osnr_db_mean_sd', 'Reference link OSNR (dB)', 'osnr_trends.png', 'classical_osnr.png'),
-               ('synergy_vs_FF', 'synergy_vs_FF_sd', 'Signed synergy vs FF', 'synergy_trends.png', 'synergy.png'),
-               ('skr_mean', 'skr_mean_sd', 'Mean link SKR per channel (kbit/s)', 'skr_trends.png', 'total_skr.png'),
+    metrics = [('osnr_db_mean', 'osnr_db_mean_sd', 'Reference link OSNR (dB)', 'osnr_trends.svg', 'classical_osnr.svg'),
+               ('synergy_vs_FF', 'synergy_vs_FF_sd', 'Signed synergy vs FF', 'synergy_trends.svg', 'synergy.svg'),
+               ('skr_mean', 'skr_mean_sd', 'Mean link SKR per channel (kbit/s)', 'skr_trends.svg', 'total_skr.svg'),
                ('blocking_rate', 'blocking_rate_sd', 'Classical blocking probability',
-                'blocking_trends.png', 'blocking_rate.png')]
+                'blocking_trends.svg', 'blocking_rate.svg')]
     for metric, sd_key, y_label, overview, filename in metrics:
         blocking = metric == 'blocking_rate'
         factor = .001 if metric == 'skr_mean' else 1
@@ -386,17 +390,11 @@ def export_business_summary(output, runs, metadata, summary):
                 target.legend(fontsize=9, loc='lower right' if blocking else 'best')
             single.suptitle(note, fontsize=8)
             figure_path = f'{group}/{filename}'
-            single.savefig(output / figure_path, dpi=180)
-            vector_path = str(Path(figure_path).with_suffix('.svg'))
-            single.savefig(output / vector_path)
-            artifacts.append(vector_path)
+            single.savefig(output / figure_path)
             plt.close(single)
             artifacts.append(figure_path)
         fig.suptitle(note, fontsize=10)
-        fig.savefig(output / overview, dpi=180)
-        vector_path = str(Path(overview).with_suffix('.svg'))
-        fig.savefig(output / vector_path)
-        artifacts.append(vector_path)
+        fig.savefig(output / overview)
         plt.close(fig)
         artifacts.append(overview)
     return artifacts

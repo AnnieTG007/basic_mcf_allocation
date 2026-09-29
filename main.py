@@ -122,8 +122,8 @@ class ClassicalService:
         self.classical_backward_cores = list(core_config["classical_backward"])
         self.quantum_cores = list(core_config["quantum"])
         all_cores = self.classical_forward_cores + self.classical_backward_cores + self.quantum_cores
-        if any(not isinstance(c, (int, np.integer)) or not 0 <= c < core_num for c in all_cores):
-            raise ValueError("芯编号必须为 [0, core_num) 内的整数")
+        if any(not isinstance(c, (int, np.integer)) or not 1 <= c <= core_num for c in all_cores):
+            raise ValueError("芯编号必须为 [1, core_num] 内的整数")
         # 固定表可显式指定两方向共享经典芯；仅禁止组内重复或经典芯与量子芯重叠。
         if (any(len(group) != len(set(group)) for group in (
                 self.classical_forward_cores, self.classical_backward_cores, self.quantum_cores))
@@ -143,11 +143,12 @@ class ClassicalService:
         self.knum = knum
         self.m_cost = np.full((self.MAXINUM, self.MAXINUM, self.knum), np.inf, dtype=float)  # 候选路径总长，km。
         self.m_path = [[[[]for _ in range(self.knum)]for _ in range(self.MAXINUM)]for _ in range(self.MAXINUM)]
+        # 芯轴直接使用 1–7 编号，第 0 项留空且不可分配。
         # 数组轴为 [源节点, 目的节点, 芯, 信道]；状态 0/1/2/3 为不可用/空闲/占用/量子保留。
-        self.m_resourceMap = np.zeros((self.MAXINUM, self.MAXINUM,self.core_num, self.WaveNumber), dtype=np.float32)
+        self.m_resourceMap = np.zeros((self.MAXINUM, self.MAXINUM,self.core_num + 1, self.WaveNumber), dtype=np.float32)
 
         # P_link 为每芯每信道已占用功率，单位 W，数组轴与资源状态一致。
-        self.P_link = np.zeros((self.MAXINUM, self.MAXINUM, self.core_num, self.WaveNumber),dtype=np.float32)
+        self.P_link = np.zeros((self.MAXINUM, self.MAXINUM, self.core_num + 1, self.WaveNumber),dtype=np.float32)
         self.ServiceQuantity = 0  # 已到达业务总数
         self.m_nextServiceId = 0  # 下一条业务的编号
         self.m_pq = []  # 按事件时刻排序的事件队列
@@ -341,7 +342,7 @@ class ClassicalService:
                 powers=self.P_link, distances=self.a_m, **self.allocation_options,
             )
             if core_list is not None:
-                # 算法统一返回芯组，如 [[0], [2]]；主控转换为事件所需的单芯或多芯格式：
+                # 算法统一返回芯组，如 [[2], [4]]；主控转换为事件所需的单芯或多芯格式：
                 # 普通业务每跳取组内唯一芯号，三芯业务保留整组。
                 return [group if self.bind_three else group[0] for group in core_list], w
         # 所有候选路径都无法分配共同信道，业务阻塞
@@ -423,7 +424,7 @@ def build_simulation(topology_path, *, algorithm="SCWA", slots=100,
     layout_table = SEVEN_CORE_EXPERIMENT_LAYOUTS if bind_three else SEVEN_CORE_LAYOUTS
     if algorithm not in layout_table:
         raise ValueError(f"算法 {algorithm} 未配置在当前七芯实验表中")
-    # core_config 是本次固定配置，例如 FF 的 quantum=(6,)，不根据芯数或列表位置推导布局。
+    # core_config 是本次固定配置，例如 FF 的 quantum=(1,)，不根据芯数或列表位置推导布局。
     core_config = layout_table[algorithm]
     # bind_three 选择实验表的固定三芯方向组；量子芯仍取表中配置，算法只支持七芯。
     params = SimulationParameters(

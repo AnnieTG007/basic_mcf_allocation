@@ -60,6 +60,8 @@ def create_config(args, sim, *, algorithm_labels, warmup, seeds, loads, powers,
             forward_cores=list(sim.classical_forward_cores),
             backward_cores=list(sim.classical_backward_cores),
             quantum_cores=list(sim.quantum_cores),
+            quantum_frequencies_hz=[float(f) for f in sim.available_channel[:sim.quantum_wave_num]],
+            classical_frequencies_hz=[float(f) for f in sim.available_channel[sim.quantum_wave_num:]],
             first_fiber=asdict(sim.first_fiber), secondary_fiber=asdict(sim.secondary_fiber))
     return config
 
