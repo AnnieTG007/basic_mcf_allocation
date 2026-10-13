@@ -21,6 +21,7 @@ class ResourceAllocator:
             frequencies,           # 信道索引对应的频率（Hz），例如 [193.5e12, 193.4e12]。
             *,
             allow_bidirectional=False,  # 是否允许同一纤芯、同一信道内双向同频数据信号同时传输；默认 False（不允许）。
+            paired_groups=None,    # 可选反向绑定表，如 {(2,3,4):(5,6,7), (5,6,7):(2,3,4)}；由主控提供。
             # 芯是否能承载某方向由前后向候选列表决定；双向共有芯仍可波长 1 正向、波长 2 反向，本开关只约束同频。
     ):
         """前向指节点号小到大，后向相反；[(2,), (4,)] 是两个备选组，[(2, 4)] 是一个两芯组。"""
@@ -49,6 +50,13 @@ class ResourceAllocator:
         self.backward_groups = tuple(sorted(self.backward_groups, key=lambda group: tuple(
             layout['classical_backward'].index(core) for core in group)))
         self.allow_bidirectional = allow_bidirectional
+        self.paired_groups = dict(paired_groups or {})
+        for group, partner in self.paired_groups.items():
+            if (self.paired_groups.get(partner) != group
+                    or not ((group in self.forward_groups and partner in self.backward_groups)
+                            or (group in self.backward_groups and partner in self.forward_groups))
+                    or set(group) & set(partner)):
+                raise ValueError('反向绑定必须是方向候选中互不重叠、互相配对的芯组')
 
     def allocate(
             self,
@@ -246,26 +254,31 @@ class ResourceAllocator:
         return None, -1
 
     def _available(self, a, b, group, wave, resources):
-        """判断本跳芯组在指定信道是否全部空闲，并检查反向同芯同频占用限制。"""
+        """检查本跳芯组及其绑定反向组是否同时空闲，并遵守同芯同频限制。"""
         # a/b 如 0/1，group 如 (2,4)，wave 为信道索引；resources 同 allocate。
         # core 为组内芯编号，例如 2；需要组内所有芯空闲，并按通用开关决定是否允许反向同芯同频同时占用。
-        return all(resources[a, b, core, wave] == 1
-                   and (self.allow_bidirectional or resources[b, a, core, wave] != 2)
-                   for core in group)
+        members = [(a, b, core) for core in group]
+        members += [(b, a, core) for core in self.paired_groups.get(group, ())]
+        return all(resources[src, dst, core, wave] == 1
+                   and (self.allow_bidirectional or resources[dst, src, core, wave] != 2)
+                   for src, dst, core in members)
 
     def _candidate(self, a, b, group, wave, launch_power, resources, powers, distance,
                    first_fiber, secondary_fiber, first_neighbors, secondary_neighbors):
         """计算候选芯组新增量子噪声与同向同频邻芯占用数，返回评分字典。"""
         # 输入同 allocate/_available；distance 单位 m，模型与邻芯表同 _qcnm。
         # deltas 为组内各芯新增噪声（W），例如 [1e-12, 2e-12, 0]；core 是成员编号，例如 2。
+        # members 包含本向组及绑定反向组；反向光使用实际传播方向评分，不能忽略其噪声。
+        members = [(a, b, core) for core in group]
+        members += [(b, a, core) for core in self.paired_groups.get(group, ())]
         deltas = [self._core_noise(
-            a, b, core, wave, launch_power, resources, powers, distance,
+            src, dst, core, wave, launch_power, resources, powers, distance,
             first_fiber, secondary_fiber, first_neighbors, secondary_neighbors)
-            for core in group]
+            for src, dst, core in members]
         # neighbors 是同向同频最近邻占用总数，例如 2；同一邻芯若邻接多个成员，会分别计数。
         neighbors = sum(
-            self._same_direction_count(a, b, core, wave, resources, first_neighbors)
-            for core in group)
+            self._same_direction_count(src, dst, core, wave, resources, first_neighbors)
+            for src, dst, core in members)
         # 物理模型按经典芯相加；每芯均加载 launch_power，而不是用某一芯噪声乘组大小。
         return dict(cores=group, noise=sum(deltas), neighbors=neighbors)
 

@@ -40,16 +40,16 @@ python main.py --scan-all `
   --slots 100 `
   --warmup 10
 
-# 三芯业务仿真并直接映射为一小时实验回放（含预热）
-# 导出 CCA、QCNM 的双向回放及指标
+# 六芯配对业务：仅生成前向请求，同步绑定对应后向业务，固定6个经典波长
+# 显式负载为实际配对请求负载，不会再次减半
 python main.py --export-business `
-  --loads 3 6 9 12 15 18 `
-  --powers 0 2 4 6 8 `
-  --fixed-power 8 `
-  --fixed-load 18 `
+  --loads 5 6 7 8 9 10 `
+  --powers 7 8 9 10 11 12 `
+  --fixed-power 10 `
+  --fixed-load 8 `
   --algorithm ALL `
   --topology topology7 `
-  --slots 100 `
+  --slots 50 `
   --warmup 10 `
   --seed 42 `
   --experiment-duration-seconds 3600
@@ -71,7 +71,7 @@ python main.py --help
 
 普通扫描默认比较 QCNM 的容忍系数列表、CCA 和 FF；实验回放默认只导出 CCA 和单个 QCNM 容忍系数（当前为 0.3）。`--algorithm` 支持多选；普通扫描可选择全部五种算法，`ALL` 展开全部算法。实验回放仅允许选择 CCA、QCNM，其 `ALL` 也仅展开这两种算法。未选 FF 时内部补跑基准，不额外导出 FF 曲线或回放文件。
 
-`--qcnm-noise-rtol` 支持自选容忍系数列表；普通单次运行与实验回放默认使用 0.3，扫描默认遍历 0 到 0.5、步长 0.1。默认值只在 [main.py](main.py) 顶部定义一处，本文不再重复具体数字；以 `python main.py --help` 的输出和导出目录中的实际参数为准。算法名称仅使用 `CQLI`、`CCA`、`FF`、`SCWA`、`QCNM`，不保留旧名称或旧参数别名。容忍系数的定义及固定三芯组结果可能相同的原因见 [algorithm.py](algorithm.py)。
+`--qcnm-noise-rtol` 支持自选容忍系数列表；普通单次运行与实验回放默认使用 0.3，扫描默认遍历 0 到 0.5、步长 0.1。默认值只在 [main.py](main.py) 顶部定义一处，本文不再重复具体数字；以 `python main.py --help` 的输出和导出目录中的实际参数为准。算法名称仅使用 `CQLI`、`CCA`、`FF`、`SCWA`、`QCNM`，不保留旧名称或旧参数别名。容忍系数的定义及固定六芯配对组结果可能相同的原因见 [algorithm.py](algorithm.py)。
 
 `--scan-all` 输出三个独立扫描到 `load_scan/`、`power_scan/`、`distance_scan/`；普通扫描图为四指标 SVG，业务回放图为 PNG/SVG。详细参数见 `python main.py --help`，统计与数据格式见下列脚本注释。
 

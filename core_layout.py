@@ -43,8 +43,8 @@ SEVEN_CORE_LAYOUTS = {
     ),
 }
 
-# SEVEN_CORE_EXPERIMENT_LAYOUTS 为调用方的固定实验布局，例如 FF 前向绑定 (2, 3, 4)。
-# 哪些算法参与实验、是否绑定这些芯由 main 决定，算法模块不读取此表。
+# SEVEN_CORE_EXPERIMENT_LAYOUTS 为六芯配对实验布局，例如 FF 前向 (2,3,4)、后向 (5,6,7)。
+# main 将前后三芯绑定为同波长、同时占用与释放的一对；算法模块不读取此表。
 SEVEN_CORE_EXPERIMENT_LAYOUTS = {
     'FF': dict(
         classical_forward=(2, 3, 4),

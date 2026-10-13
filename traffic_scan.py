@@ -55,6 +55,9 @@ def create_config(args, sim, *, algorithm_labels, warmup, seeds, loads, powers,
         source_sha256=source_hashes(Path(__file__).resolve().parent, args.topology))
     if sim is not None:
         config.update(
+            traffic_mode='forward_requests_with_paired_reverse' if sim.bind_six else 'independent_directions',
+            bound_cores_per_hop=6 if sim.bind_six else 1,
+            load_unit='bidirectional_pairs' if sim.bind_six else 'unidirectional_services',
             observed_link=list(sim.observed_link),
             observed_link_length_m=float(sim.a_m[sim.observed_link]),
             forward_cores=list(sim.classical_forward_cores),
@@ -105,8 +108,8 @@ def measure_run(sim, warmup, event_recorder=None):
                 duration = max(0.0, min(sim.Ts, event.m_time + event.m_holdTime)
                                - max(warmup, event.m_time))
                 carried_time += duration
-                # 逐跳累加实际占用芯数：单芯业务每跳一芯，三芯业务每跳三芯。
-                occupied_time += duration * sum(np.size(cores) for cores in event.m_ocuppiedcore)
+                # 普通业务每跳一芯，六芯配对业务两方向合计六芯；承载量仍按请求计一次。
+                occupied_time += duration * sum(np.size(cores) for _, _, cores in sim.event_resources(event))
         else:
             active -= 1
 
@@ -421,24 +424,24 @@ def summarize_business(runs):
 
 
 def run_business_export(args, build_simulation, base, *, variants):
-    """运行主控指定的三芯业务组合并导出所选链路回放，返回批次索引。
-负载按全网双向合计业务组计数，每芯每信道功率保持输入值。"""
+    """运行六芯绑定业务并导出所选链路回放，返回批次索引。
+负载按前向配对请求计数，每个请求同波长占用前后三芯，每芯功率保持输入值。"""
     # 在仿真前检查工作簿和图表所需依赖。
     import openpyxl  # noqa: F401
     import matplotlib  # noqa: F401
 
     if args.scan_load or args.scan_scenarios:
         raise ValueError('--export-business 不与统计扫描模式同时使用')
-    if args.classical_channels <= 0:
-        raise ValueError('实验经典信道数必须为正整数')
-    # 三芯实验固定量子频率 193.5 THz（C35），排除经典频率 193.3 THz（C33）。
+    if args.classical_channels != 6:
+        raise ValueError('六芯实验固定使用6个经典信道')
+    # 六芯实验固定量子 C35，经典 C34、C36–C40；频率由主控的六信道规则生成。
     if args.quantum_channels != 1 or args.include_c33:
         raise ValueError('实验业务导出使用 C35 量子信道，经典信道跳过 C33')
-    # 三芯组负载不除以三，也不为达到阻塞率目标自动降载；默认保持时间为 4。
+    # 旧双向独立请求改为一条前向配对请求，默认到达负载减半一次；显式负载即实际配对请求负载。
     loads, seeds, warmup, _ = scan_settings(args)
     if args.loads is None:
-        loads = [5, 10, 15, 20, 25, 30, 35, 40]
-    fixed_load = 10 if args.fixed_load is None else args.fixed_load
+        loads = [2.5, 5, 7.5, 10, 12.5, 15, 17.5, 20]
+    fixed_load = 5 if args.fixed_load is None else args.fixed_load
     powers = args.powers if args.powers is not None else [7, 8, 9, 10, 10.5]
     if not math.isfinite(fixed_load) or fixed_load <= 0:
         raise ValueError('fixed-load 必须为有限正数')
@@ -457,10 +460,12 @@ def run_business_export(args, build_simulation, base, *, variants):
     experiments = [('load_scan', load, args.fixed_power) for load in loads]
     experiments += [('power_scan', fixed_load, power) for power in sorted(powers)]
     # manifest 汇总本批次文件、单次指标与跨种子统计；回放格式与文件命名见 traffic_export 模块说明。
-    manifest = dict(description='Three-core experiment batch: per-run channel replay, config and summary',
+    manifest = dict(description='Six-core paired experiment batch: per-run channel replay, config and summary',
                     config='config.json', files=[], artifacts=[])
-    # 三芯导出仅选择 CCA/QCNM；主控补跑的 FF 仅用于配对基准，不导出其回放或曲线。
+    # 六芯导出仅选择 CCA/QCNM；主控补跑的 FF 仅用于配对基准，不导出其回放或曲线。
     references, runs = {}, []
+    # 首个导出算法提供批次公共参数；逐算法芯表单独记录，避免最后补跑的 FF 冒充 CCA/QCNM 布局。
+    config_sim, algorithm_layouts = None, {}
     for group, load, power in experiments:
         for seed in seeds:
             for variant in variants:
@@ -472,9 +477,15 @@ def run_business_export(args, build_simulation, base, *, variants):
                     classical_channels=args.classical_channels, quantum_channels=1,
                     launch_power=1e-3 * 10 ** (power / 10), link_length_km=args.link_length_km,
                     skip_c33=True,
-                    allow_bidirectional=args.allow_bidirectional, qcnm_noise_rtol=variant["qcnm_noise_rtol"] or 0.0, bind_three=True, observe_link=args.observe_link,
+                    allow_bidirectional=args.allow_bidirectional, qcnm_noise_rtol=variant["qcnm_noise_rtol"] or 0.0, bind_six=True, observe_link=args.observe_link,
                         observe_link_length_km=args.observe_link_length_km,
                         key_pulses=args.key_pulses, key_gamma=args.key_gamma)
+                if config_sim is None and variant['export']:
+                    config_sim = sim
+                algorithm_layouts[algorithm] = dict(
+                    forward_cores=list(sim.classical_forward_cores),
+                    backward_cores=list(sim.classical_backward_cores),
+                    quantum_cores=list(sim.quantum_cores))
                 recorder = TrafficRecorder(sim)
                 metrics, samples = measure_run(sim, warmup, event_recorder=recorder)
                 key = (load, seed)
@@ -501,10 +512,12 @@ def run_business_export(args, build_simulation, base, *, variants):
     runs = select_comparison_rows(runs, variants, ('group', 'load_erlang', 'power_dbm', 'seed'))
     # config 记录本次实验实际生效的仿真参数与模型版本，供实验端和各算法回放核对；
     # 指标口径与数据格式说明写在代码注释与 traffic_export 模块说明里，不写进结果文件。
-    config = create_config(args, sim, algorithm_labels=algorithms, warmup=warmup,
+    config = create_config(args, config_sim, algorithm_labels=algorithms, warmup=warmup,
                            seeds=seeds, loads=loads, powers=sorted(powers), fixed_load=fixed_load,
                            fixed_power=args.fixed_power, variants=variants)
     config['experiment_duration_seconds'] = args.experiment_duration_seconds
+    config['layout_algorithm'] = config_sim.algorithm
+    config['algorithm_layouts'] = algorithm_layouts
     # 配对协同度所需标尺取自同工况单次结果，随 config 一起导出便于复算。
     for key in ('synergy_skr_lower', 'synergy_skr_upper',
                 'synergy_reference_launch_power_w', 'synergy_reference_xt_power_w'):
