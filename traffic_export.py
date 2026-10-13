@@ -188,17 +188,17 @@ def write_trace(path, trace):
     return sha256(path.read_bytes()).hexdigest()
 
 
-def export_excel(path, tables):
+def export_excel(path, tables, *, x_key=None):
     """将 tables 汇总记录写为黑白工作簿，包含条件、算法、四项指标及相对 FF 的比值。"""
     from openpyxl import Workbook
     from openpyxl.styles import Alignment
     from openpyxl.utils import get_column_letter
 
-    # tables 如 [(表名, 汇总记录, [(条件键, 显示名)])]，同表用全部条件匹配基准。
+    # tables 如 [(表名, 汇总记录, [(条件键, 显示名)])]；x_key 指定扫描横轴时按指标横排算法。
     workbook = Workbook()
     workbook.remove(workbook.active)
-    # 秘密密钥率（SKR）由 bit/s 转 kbit/s；光信噪比（OSNR）显示 dB，比值使用线性值。
-    metrics = [('skr_mean', 'SKR (kbit/s)', .001, '0.000'),
+    # 秘密密钥率（SKR）保留 bps（bit/s）；光信噪比（OSNR）显示 dB，比值使用线性值。
+    metrics = [('skr_mean', 'SKR (bps)', 1, '0.000'),
                ('osnr_db_mean', 'OSNR (dB)', 1, '0.000'),
                ('blocking_rate', '阻塞率', 1, '0.00%'),
                ('synergy_vs_FF', '协同度', 1, '0.000000')]
@@ -234,6 +234,49 @@ def export_excel(path, tables):
                 for cell in cells:
                     cell.number_format = number_format
         sheet.row_dimensions[1].height = 30
+        if x_key is not None:
+            # 复用上面的单位换算和 FF 配对结果，仅改变排布，不重新计算统计。
+            x_column = [key for key, _ in conditions].index(x_key)
+            fixed_columns = [i for i in range(len(conditions)) if i != x_column]
+            curves = {}
+            for values in sheet.iter_rows(min_row=2, values_only=True):
+                curve = tuple(values[i] for i in fixed_columns) + (values[len(conditions)],)
+                points = curves.setdefault(curve, {})
+                x = values[x_column]
+                if x in points:
+                    raise ValueError(f'{name} 同一算法和工况出现重复横轴值：{x}')
+                points[x] = values[len(conditions) + 1:]
+            x_values = sorted({x for points in curves.values() for x in points})
+            metric_names = ['SKR', 'OSNR', '阻塞率', '协同度',
+                            'SKR比值', 'OSNR比值', '阻塞率比值', '协同度比值']
+            if len(curves) + 1 > 16_384:
+                raise ValueError(f'{name} 超过 Excel 列数上限')
+            for index, metric_name in enumerate(metric_names):
+                wide = workbook.create_sheet(f'{name}_{metric_name}')
+                label = headers[len(conditions) + 1 + index]
+                if index == 2:
+                    label = '阻塞率 (%)'
+                curve_headers = []
+                for curve in curves:
+                    fixed = '; '.join(f'{conditions[i][1]}={value}'
+                                      for i, value in zip(fixed_columns, curve[:-1]))
+                    curve_headers.append(f'{curve[-1]} | {label}' + (f' | {fixed}' if fixed else ''))
+                wide.append([conditions[x_column][1]] + curve_headers)
+                for x in x_values:
+                    values = [points[x][index] if x in points else None for points in curves.values()]
+                    # 百分率写成 0–100 的普通数值，复制到 Origin 后无需解析百分号。
+                    if index == 2:
+                        values = [value * 100 if value is not None else None for value in values]
+                    wide.append([x] + values)
+                wide.freeze_panes = 'B2'
+                wide.row_dimensions[1].height = 75
+                for column in range(1, len(curves) + 2):
+                    wide.column_dimensions[get_column_letter(column)].width = 24 if column == 1 else 40
+                    wide.cell(1, column).alignment = Alignment(wrap_text=True, vertical='center')
+                    for cells in wide.iter_cols(min_col=column, max_col=column, min_row=2):
+                        for cell in cells:
+                            cell.number_format = '0.###############'
+            workbook.remove(sheet)
     workbook.save(path)
 
 
@@ -412,7 +455,10 @@ def export_business_summary(output, runs, metadata, summary):
 
 def export_scan_results(output, data):
     """将扫描汇总导出为 traffic_scan.xlsx 和四指标对比 SVG，不重算统计。"""
-    export_excel(output / 'traffic_scan.xlsx', [('汇总', data['summary'], [
+    scan_axis = data['config'].get('scan_axis', 'load')
+    x_key = {'load': 'offered_load_erlang', 'power': 'power_dbm',
+             'distance': 'observed_length_m'}[scan_axis]
+    export_excel(output / 'traffic_scan.xlsx', [('扫描', data['summary'], [
         ('offered_load_erlang', '负载 (Erlang)'), ('power_dbm', '功率 (dBm)'),
-        ('observed_length_m', '链路长度 (m)')])])
-    return plot_scan(output, data['summary'], data['config'].get('scan_axis', 'load'))
+        ('observed_length_m', '链路长度 (m)')])], x_key=x_key)
+    return plot_scan(output, data['summary'], scan_axis)

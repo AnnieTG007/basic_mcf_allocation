@@ -449,7 +449,7 @@ def build_simulation(topology_path, *, algorithm="SCWA", slots=100,
         qcnm_noise_rtol=qcnm_noise_rtol, allow_bidirectional=allow_bidirectional,
     )
     # 探测参数含义与单位见 DetectorParameters；命令行功率在调用前由 dBm 换为 W。
-    detector = DetectorParameters(efficiency=0.2, gate_time=1e-9,
+    detector = DetectorParameters(efficiency=0.11, gate_time=1e-9,
                                   insertion_loss_db=8, rate_hz=50e6)
     # key_pulses 为静态块脉冲数，key_gamma 为高斯波动倍数；1e10 脉冲在 50 MHz 下为 200 秒。
     # 此物理块时长与仿真时隙无换算关系；诱骗态强度与概率取 BB84Parameters 的默认信号、弱诱骗与真空态。

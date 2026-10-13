@@ -32,13 +32,15 @@ python main.py --scan-load `
 # 一条命令完成负载、功率、距离三组扫描
 python main.py --scan-all `
   --loads 5 10 15 20 25 30 35 40 45 50 `
-  --powers 0 2 4 6 8 `
-  --distances 1 5 10 20 `
+  --powers 0 2 4 6 8 10 12 14 `
+  --distances 5 10 15 20 25 30 35 40 45 50 `
   --fixed-load 40 `
   --launch-power-dbm 8 `
   --seeds 42 `
   --slots 100 `
-  --warmup 10
+  --warmup 10 `
+  --algorithm CQLI SCWA QCNM CCA FF `
+  --qcnm-noise-rtol 0 0.3 0.6
 
 # 六芯配对业务：仅生成前向请求，同步绑定对应后向业务，固定6个经典波长
 # 显式负载为实际配对请求负载，不会再次减半
