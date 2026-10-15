@@ -131,7 +131,7 @@ class TrafficRecorder:
             cores = sim.classical_forward_cores if a < b else sim.classical_backward_cores
             if (not np.array_equal(resources, actual)
                     or not np.all(recorded[cores] == recorded[cores[0]])
-                    or not np.allclose(powers, np.where(resources == 2, sim.launch_power, 0),
+                    or not np.allclose(powers, np.where(resources == 2, sim.channel_launch_powers[sim.quantum_wave_num:], 0),
                                        rtol=1e-6, atol=0)):
                 raise ValueError('六芯回放与实际资源或每芯功率不一致')
 
@@ -155,6 +155,8 @@ class TrafficRecorder:
                     backward_cores=list(self.sim.classical_backward_cores),
                     quantum_frequencies_hz=[float(f) for f in self.sim.available_channel[:self.sim.quantum_wave_num]],
                     classical_frequencies_hz=[float(f) for f in self.sim.available_channel[self.sim.quantum_wave_num:]],
+                    # 与经典频率表逐项对应，记录仿真中前后向每芯的实际功率，不是设备控制指令。
+                    classical_launch_powers_w=self.sim.channel_launch_powers[self.sim.quantum_wave_num:].tolist(),
                     duration_s=float(self.sim.Ts),
                     states=self.trace)
 

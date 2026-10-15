@@ -163,6 +163,10 @@ class ClassicalService:
         self.initialize()
         # bind_six=True 时一个前向请求同步占用前后三芯，共用波长与生命周期。
         self.bind_six = bind_six
+        # 每芯各信道的实际功率（W）；业务导出的 C34 双向固定衰减 10 dB，其余保持设定功率。
+        self.channel_launch_powers = np.full(self.WaveNumber, self.launch_power)
+        if bind_six:
+            self.channel_launch_powers[np.abs(np.asarray(self.available_channel) - 193.4e12) < 1e5] *= 0.1
         if bind_six and (len(self.classical_forward_cores) != 3
                            or len(self.classical_backward_cores) != 3
                            or len(set(self.classical_forward_cores + self.classical_backward_cores)) != 6):
@@ -314,6 +318,7 @@ class ClassicalService:
                 self.m_sumOfFailedService += 1
             else:
                 event.m_ocuppiedwave = reg_wave
+                event.P = float(self.channel_launch_powers[reg_wave])
                 event.m_ocuppiedcore = core_list  # 六芯模式保留逐跳本向芯组，反向资源由 event_resources 展开。
                 # 同一跳的绑定芯共用信道，每芯写入完整功率 P，而非按芯数平分。
                 for a, b, cores in self.event_resources(event):
@@ -352,7 +357,7 @@ class ClassicalService:
                 return None, -1  # 没有更多候选路径
             event.m_workPath = list(self.m_path[s][d][ki])
             core_list, w = self.allocator.allocate(
-                event.m_workPath, event.P, resources=self.m_resourceMap,
+                event.m_workPath, self.channel_launch_powers, resources=self.m_resourceMap,
                 powers=self.P_link, distances=self.a_m, **self.allocation_options,
             )
             if core_list is not None:
@@ -449,7 +454,7 @@ def build_simulation(topology_path, *, algorithm="SCWA", slots=100,
         qcnm_noise_rtol=qcnm_noise_rtol, allow_bidirectional=allow_bidirectional,
     )
     # 探测参数含义与单位见 DetectorParameters；命令行功率在调用前由 dBm 换为 W。
-    detector = DetectorParameters(efficiency=0.11, gate_time=1e-9,
+    detector = DetectorParameters(efficiency=0.1, gate_time=1e-8,
                                   insertion_loss_db=8, rate_hz=50e6)
     # key_pulses 为静态块脉冲数，key_gamma 为高斯波动倍数；1e10 脉冲在 50 MHz 下为 200 秒。
     # 此物理块时长与仿真时隙无换算关系；诱骗态强度与概率取 BB84Parameters 的默认信号、弱诱骗与真空态。
@@ -468,13 +473,13 @@ def build_simulation(topology_path, *, algorithm="SCWA", slots=100,
         c=299792458,
         e3=6.1796e-14,
         n=1.45,
-        hmn=1e-9,
+        hmn=5e-9,
         recapture_factor_Rayleigh=0.0015,
         loss_Rayleigh=0.000032,
-        width=1.2e-10,
+        width=2e-10,
         temperature=300.0,  # K，室温近似；不是实验测量值。
     )
-    # 最近邻/次近邻的 hmn 分别沿用 1e-9/1e-10 m^-1，不是几何函数返回的耦合矩阵。
+    # 最近邻/次近邻的 hmn 分别为 5e-9/1e-10 m^-1，不是几何函数返回的耦合矩阵。
     first_fiber = fiber
     secondary_fiber = replace(fiber, hmn=1e-10)
     # 这里只取几何邻接关系；返回的耦合矩阵不参与噪声计算，噪声使用上面的 hmn。

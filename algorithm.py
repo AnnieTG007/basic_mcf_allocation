@@ -61,7 +61,7 @@ class ResourceAllocator:
     def allocate(
             self,
             path,           # 简单路径的节点序列，例如 [0, 1, 2]；不跨候选路径比较分数。
-            launch_power,   # 每个新增芯信道的发射功率，例如 0.01 W。
+            launch_power,   # 每芯发射功率（W）：统一标量或与频率表对齐的逐信道数组。
             *,
             resources,      # [源节点, 目的节点, 芯, 信道] 状态数组，例如 resources[0,1,2,3]=1。
             powers,         # 同维度已占用功率数组，例如 powers[0,1,2,3]=0.01 W。
@@ -77,8 +77,11 @@ class ResourceAllocator:
             return None, -1
         if len(set(path)) != len(path):
             raise ValueError('分配要求路径为简单路径，节点不重复')
-        if not np.isfinite(launch_power) or launch_power <= 0:
+        launch_power = np.asarray(launch_power, dtype=float)
+        if (launch_power.ndim > 1 or (launch_power.ndim == 1 and launch_power.shape != (resources.shape[-1],))
+                or not np.all(np.isfinite(launch_power)) or np.any(launch_power <= 0)):
             raise ValueError('发射功率必须为有限正数')
+        launch_power = np.broadcast_to(launch_power, (resources.shape[-1],))
         # methods 将算法名称映射到对应方法，例如 methods['FF'] 为 self._ff。
         methods = {
             'CQLI': self._cqli, 'CCA': self._cca, 'FF': self._ff,
@@ -175,7 +178,7 @@ class ResourceAllocator:
             for a, b in zip(path, path[1:]):
                 # candidates 为本跳本频点可用组的评分列表；元素 candidate 为其中一个评分字典。
                 candidates = [self._candidate(
-                                  a, b, group, wave, launch_power, resources, powers, distances[a, b],
+                                  a, b, group, wave, float(launch_power[wave]), resources, powers, distances[a, b],
                                   first_fiber, secondary_fiber,
                                   first_neighbors, secondary_neighbors)
                               for group in (self.forward_groups if a < b else self.backward_groups)

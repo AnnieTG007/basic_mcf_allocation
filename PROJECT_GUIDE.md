@@ -50,6 +50,8 @@
 
 ## 正式仿真与模块职责
 
+- `--export-business` 中 C34（193.4 THz）前后向每芯的实际发射功率固定比扫描设定值低 10 dB，其余经典信道使用设定值；包括内部 FF 基准。分配候选评分、资源功率及 SKR/OSNR 均使用实际逐信道功率。回放以 `classical_launch_powers_w` 记录与经典频率表对齐的实际功率，批次配置记录 `classical_power_offsets_db`；两者是仿真依据，不是硬件控制命令。普通运行和普通扫描不施加此衰减，协同度参考标尺仍使用扫描设定功率。
+
 - `main.py`：唯一命令行入口、实例构建和业务事件仿真。`ClassicalService.iter_slots()` 是唯一事件循环；单次 `run()` 和扫描测量都复用它，观察回调不修改资源。
 - `traffic_scan.py`：由 `main.py --scan-load/--scan-power/--scan-distance/--scan-all` 或 `--export-business` 调用，负责负载/功率/距离实验编排、配对业务校验、窗口内采样、跨种子统计和统一源码哈希清单；通过实例的 `iter_slots()` 观察事件，不另写事件循环，不反向导入 `main.py`。
 - `traffic_export.py`：记录资源状态变化、序列化实验业务回放 JSON、生成 Excel 和图表；普通扫描仅导出 Excel 和图片；仅接收实例状态或已统计的结果，不生成业务、不做分配决策、不编排扫描，不反向导入 `main.py` 或 `traffic_scan.py`。

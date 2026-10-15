@@ -46,14 +46,15 @@ python main.py --scan-all `
 # 显式负载为实际配对请求负载，不会再次减半
 python main.py --export-business `
   --loads 5 6 7 8 9 10 `
-  --powers 7 8 9 10 11 12 `
-  --fixed-power 10 `
+  --powers -5 -4 -3 -2 -1 0 `
+  --fixed-power -1 `
   --fixed-load 8 `
   --algorithm ALL `
   --topology topology7 `
   --slots 50 `
   --warmup 10 `
   --seed 42 `
+  --key-pulse 1e7 `
   --experiment-duration-seconds 3600
 
 # 自选普通扫描算法和 QCNM 容忍系数；实验导出只接受 CCA、QCNM

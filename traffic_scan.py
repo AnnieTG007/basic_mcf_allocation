@@ -65,6 +65,9 @@ def create_config(args, sim, *, algorithm_labels, warmup, seeds, loads, powers,
             quantum_cores=list(sim.quantum_cores),
             quantum_frequencies_hz=[float(f) for f in sim.available_channel[:sim.quantum_wave_num]],
             classical_frequencies_hz=[float(f) for f in sim.available_channel[sim.quantum_wave_num:]],
+            # 相对扫描设定功率的逐信道偏移（dB）；各工况实际功率随回放单独记录。
+            classical_power_offsets_db=(10 * np.log10(
+                sim.channel_launch_powers[sim.quantum_wave_num:] / sim.launch_power)).tolist(),
             first_fiber=asdict(sim.first_fiber), secondary_fiber=asdict(sim.secondary_fiber))
     return config
 
@@ -425,7 +428,7 @@ def summarize_business(runs):
 
 def run_business_export(args, build_simulation, base, *, variants):
     """运行六芯绑定业务并导出所选链路回放，返回批次索引。
-负载按前向配对请求计数，每个请求同波长占用前后三芯，每芯功率保持输入值。"""
+负载按前向配对请求计数，每个请求同波长占用前后三芯；C34 每芯功率比输入值低 10 dB，其余保持输入值。"""
     # 在仿真前检查工作簿和图表所需依赖。
     import openpyxl  # noqa: F401
     import matplotlib  # noqa: F401
