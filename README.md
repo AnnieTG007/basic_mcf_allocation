@@ -2,7 +2,7 @@
 
 仿真多芯光纤中经典通信与量子密钥分发（QKD）共存时的资源分配，比较 CQLI（Classical and quantum signal layered interleaved，经典量子信号分层交错资源分配）、CCA（Conventional channel allocation，传统信道分配方案）、FF（first-fit，首次适配）、SCWA（Synergistic core and wavelength allocation，协同纤芯波长分配方案）和 QCNM（Quantum channel noise mitigation，量子信道噪声抑制）的秘密密钥率（SKR）、经典光信噪比（OSNR）、阻塞率，以及相对 FF 的有符号协同度。
 
-当前五种算法使用固定七芯配置，不支持任意芯数或布局覆盖。SCWA 使用参考的固定余量10切换规则，信道奇偶按原索引划分，失败时不回退。
+默认五种算法使用固定七芯配置，不支持任意布局覆盖。另有 `--single-core` 单芯共纤模式，支持 CCA、QCNM、FF。SCWA 使用参考的固定余量10切换规则，信道奇偶按原索引划分，失败时不回退。
 
 ## 快速开始
 
@@ -68,6 +68,27 @@ python main.py --scan-load `
 python main.py --help
 ```
 
+单芯与 MCF 共用 `--export-business`。下面是一条完整的十路单芯命令，所有实验参数直接通过命令行设置：
+
+```powershell
+python -B main.py --export-business `
+  --single-core --single-core-spectrum high10 `
+  --algorithm CCA QCNM --qcnm-noise-rtol 0 `
+  --link-length-km 5 `
+  --loads 0.5 1 1.5 2 2.5 3 --fixed-power -12 `
+  --powers -16 -15 -14 -13 -12 -11 --fixed-load 2 `
+  --seeds 42 --slots 100 --warmup 10 --holding-time 4 `
+  --experiment-duration-seconds 3600 `
+  --output-dir results/single_core_high10
+```
+
+- `--loads` 设置负载扫描点，使用 `--fixed-power` 指定的功率。
+- `--powers` 设置功率扫描点，使用 `--fixed-load` 指定的负载。
+- `--single-core-spectrum high10` 选择 C36 至 C40.5、间隔 50 GHz 的十路候选频点，自动确定信道数；其他固定方案见 `python main.py --help` 和 [main.py](main.py)。
+- `--output-dir` 指定新的空输出目录；省略时自动创建时间戳目录。
+
+与 MCF 一样，一次运行生成 `load_scan/`、`power_scan/` 两组回放，以及 `config.json`、`manifest.json`、`skr_summary.xlsx` 和汇总图表。两组扫描相互独立，不会遍历负载和功率的全部组合；无需环境变量或外层循环。单芯的双向负载、芯编号及模型含义见 [traffic_scan.py](traffic_scan.py) 和 [noise_calculation.py](noise_calculation.py)。
+
 `--export-business` 一次完成仿真、实验时间映射和导出，回放 JSON 可由实验端直接读取，无需额外转换。`--experiment-duration-seconds 3600` 指每份回放的总时长（含预热），可改为所需秒数；上述 100 个时隙映射为 3600 秒，其中 10 个预热时隙占 360 秒。省略该参数则保留仿真时间单位。每个批次目录含 `config.json`（本次实际生效的全部仿真参数）、`manifest.json`（文件摘要与汇总）和逐次回放 JSON；回放只按时刻列出前后向占用信道，实验端可用 `forward_cores`/`backward_cores` 核对自身设置，字段含义见 [traffic_export.py](traffic_export.py) 顶部说明。`--reexport-traffic` 可把已有回放按新的实验时长另存到指定目录。
 
 扫描及回放自动保存到 `results/` 下的新目录；普通扫描仅导出 Excel 和 SVG 图，实验业务回放另外导出 JSON。可用 `--output-dir` 指定新的空目录。普通单次运行只打印结果。
@@ -76,7 +97,7 @@ python main.py --help
 
 `--qcnm-noise-rtol` 支持自选容忍系数列表；普通单次运行与实验回放默认使用 0.3，扫描默认遍历 0 到 0.5、步长 0.1。默认值只在 [main.py](main.py) 顶部定义一处，本文不再重复具体数字；以 `python main.py --help` 的输出和导出目录中的实际参数为准。算法名称仅使用 `CQLI`、`CCA`、`FF`、`SCWA`、`QCNM`，不保留旧名称或旧参数别名。容忍系数的定义及固定六芯配对组结果可能相同的原因见 [algorithm.py](algorithm.py)。
 
-`--scan-all` 输出三个独立扫描到 `load_scan/`、`power_scan/`、`distance_scan/`；普通扫描图为四指标 SVG，业务回放图为 PNG/SVG。详细参数见 `python main.py --help`，统计与数据格式见下列脚本注释。
+`--scan-all` 输出三个独立扫描到 `load_scan/`、`power_scan/`、`distance_scan/`；普通扫描图为四指标 SVG，业务回放图为 SVG。详细参数见 `python main.py --help`，统计与数据格式见下列脚本注释。
 
 ## 阅读代码
 

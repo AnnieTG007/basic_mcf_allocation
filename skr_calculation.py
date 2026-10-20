@@ -6,7 +6,7 @@ import math
 
 import numpy as np
 
-from noise_calculation import calculate_intercore_noise_components, noise_power_to_counts
+from noise_calculation import calculate_intercore_noise_components, noise_power_to_counts, SinglecoreFiber
 
 
 @dataclass(frozen=True)
@@ -164,10 +164,12 @@ def calculate_quantum_noise_components(quantum_core, classical_core, backward, p
                                        first_neighbors, secondary_neighbors,
                                        first_fiber, secondary_fiber):
     """返回一个经典芯贡献的 (Raman 功率数组, FWM 功率数组)，单位 W。
-    只计两级邻芯；缓存数组不可原地修改，范围外返回零仅表示模型未计入。"""
+    多芯只计两级邻芯，单芯计同芯；缓存数组不可原地修改，范围外返回零仅表示模型未计入。"""
     # 两芯编号如 1/2；backward=True 为经典光相对量子光反向；powers 为有效功率谱 W。
     # quantum_indices 为目标信道索引，distance 为 m，frequencies 为 Hz；邻芯表和模型同 calculate_SKR_core。
-    if classical_core in first_neighbors[quantum_core]:
+    if classical_core == quantum_core and isinstance(first_fiber, SinglecoreFiber):
+        fiber = first_fiber
+    elif classical_core in first_neighbors[quantum_core]:
         fiber = first_fiber
     elif classical_core in secondary_neighbors[quantum_core]:
         fiber = secondary_fiber
@@ -199,7 +201,9 @@ def calculate_quantum_metrics(forward_resources, backward_resources,
         for backward, resources, powers in (
                 (False, forward_resources, forward_powers),
                 (True, backward_resources, backward_powers)):
-            for cc in first_neighbors[qc] + secondary_neighbors[qc]:
+            source_cores = ([qc] if isinstance(first_fiber, SinglecoreFiber)
+                            else first_neighbors[qc] + secondary_neighbors[qc])
+            for cc in source_cores:
                 # cc 为经典芯编号，active 只保留状态 2 的占用信道功率。
                 active = np.where(resources[cc] == 2, powers[cc], 0.0)
                 r, f = calculate_quantum_noise_components(

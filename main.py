@@ -11,11 +11,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from algorithm import ALGORITHMS, ResourceAllocator
-from core_layout import cores_code, SEVEN_CORE_LAYOUTS, SEVEN_CORE_EXPERIMENT_LAYOUTS
+from core_layout import cores_code, SEVEN_CORE_LAYOUTS, SEVEN_CORE_EXPERIMENT_LAYOUTS, SINGLE_CORE_LAYOUTS
 from skr_calculation import BB84Parameters, DetectorParameters, skr_model_config
 from synergistic_calculation import add_paired_synergy
 from topology import load_topology, distance_matrix, k_shortest_paths, validate_graph
-from noise_calculation import MulticoreFiber, calculate_classical_osnr
+from noise_calculation import MulticoreFiber, SinglecoreFiber, calculate_classical_osnr
 
 # QCNM_NOISE_RTOL 是普通单次运行与六芯业务回放共用的默认容忍系数，例如 0.3。
 # 扫描遍历的默认列表是 QCNM_NOISE_RTOLS；两者都在主控顶部这一处维护，不要在其他模块另设默认值。
@@ -23,6 +23,13 @@ QCNM_NOISE_RTOL = 0.3
 # QCNM_NOISE_RTOLS 是扫描遍历的默认容忍系数列表，也是扫描场合该参数的唯一默认来源。
 # 现按 0 到 0.5、步长 0.1 遍历；更大的 1、2、3 对协同度仍有提升，但提升速度明显低于 0 到 0.3，故不默认遍历。
 QCNM_NOISE_RTOLS = (0, 0.1, 0.2, 0.3, 0.4, 0.5)
+# 单芯固定实验频点，ITU 编号 C36.5 对应 193.65 THz；量子始终为 C35。
+SINGLE_CORE_SPECTRA = {
+    'high6': (36, 36.5, 37, 37.5, 38, 38.5),
+    'high7': (35.5, 36, 36.5, 37, 37.5, 38, 38.5),
+    'low6': (34, 32, 31.5, 31, 30.5, 30),
+    'high10': (36, 36.5, 37, 37.5, 38, 38.5, 39, 39.5, 40, 40.5),
+}
 
 
 def validated_rtols(rtols, *, source):
@@ -38,7 +45,7 @@ def validated_rtols(rtols, *, source):
 @dataclass(frozen=True)
 class SimulationParameters:
     """保存单次仿真的规模、业务、频率和资源使用参数。"""
-    core_num: int  # 固定七芯，例如 7。
+    core_num: int  # 默认固定七芯；显式单芯模式为 1。
     Ts: int  # 总时隙数，例如 30；每时隙长 1 个仿真时间单位。
     lambda1: float  # 全网请求到达率；普通模式为双向合计，六芯模式为前向配对请求，例如每时间单位 1.25 对。
     rou1: float  # 平均保持时间，例如 4；负载为 lambda1 * rou1，单位 Erlang。
@@ -49,6 +56,7 @@ class SimulationParameters:
     wave_interval: float  # 基本网格间隔，Hz，例如 100e9。
     launch_power: float  # 每芯每经典信道输入功率，W，例如 1e-3。
     seed: int  # 本实例随机业务序列的种子，例如 42。
+    single_core_spectrum: str | None = None  # 显式固定频点方案；None 沿用六/九路集合。
     excluded_classical_frequencies_hz: tuple = ()  # 排除的经典频率，Hz，例如 (193.3e12,)。
     # allow_bidirectional 为通用传输开关；例如 False 禁止同一纤芯、同一信道内双向同频数据信号同时传输。
     allow_bidirectional: bool = False
@@ -79,7 +87,7 @@ class ClassicalService:
                  detector_params, bb84_params,
                  first_neighbors, secondary_neighbors, bind_six=False, observe_link=None):
         """用拓扑、SimulationParameters 及固定芯表构建实例，物理模型与邻芯表由调用方提供。"""
-        # first_fiber/secondary_fiber 分别为最近邻、次近邻耦合使用的 MulticoreFiber 对象。
+        # first_fiber/secondary_fiber 分别为最近邻、次近邻耦合模型；单芯时二者均使用同一 SinglecoreFiber 对象。
         # observe_link 如 (0, 1) 只选观测边；默认取最短边，同长按节点编号选择。
         validate_graph(graph)
         self.graph = graph.copy()
@@ -91,7 +99,7 @@ class ClassicalService:
         self.MAXINUM = len(graph)
         if self.MAXINUM < 2:
             raise ValueError("仿真至少需要两个节点")
-        # core_num 固定为七芯；与 Ts、knum 一起只检查是否为正整数。
+        # core_num 由正式工厂选择 7 或 1；与 Ts、knum 一起检查是否为正整数。
         core_num, Ts = params.core_num, params.Ts
         lambda1, rou1, knum = params.lambda1, params.rou1, params.knum
         classical_wave_num = params.classical_wave_num
@@ -114,7 +122,7 @@ class ClassicalService:
         self.first_neighbor = deepcopy(first_neighbors)
         self.secondary_neighbor = deepcopy(secondary_neighbors)
         self.launch_power = params.launch_power
-        self.core_num = core_num  # 纤芯个数，正式构建使用七芯
+        self.core_num = core_num  # 纤芯个数，默认 7，单芯模式为 1。
         self.algorithm = algorithm
         if self.algorithm not in ALGORITHMS:
             raise ValueError(f"Unknown algorithm: {algorithm}")
@@ -124,10 +132,10 @@ class ClassicalService:
         all_cores = self.classical_forward_cores + self.classical_backward_cores + self.quantum_cores
         if any(not isinstance(c, (int, np.integer)) or not 1 <= c <= core_num for c in all_cores):
             raise ValueError("芯编号必须为 [1, core_num] 内的整数")
-        # 固定表可显式指定两方向共享经典芯；仅禁止组内重复或经典芯与量子芯重叠。
+        # 固定表允许双向共享经典芯；单芯异频共存允许量子经典芯重叠。
         if (any(len(group) != len(set(group)) for group in (
                 self.classical_forward_cores, self.classical_backward_cores, self.quantum_cores))
-                or set(self.quantum_cores) & (set(self.classical_forward_cores) | set(self.classical_backward_cores))):
+                or (core_num != 1 and set(self.quantum_cores) & (set(self.classical_forward_cores) | set(self.classical_backward_cores)))):
             raise ValueError("芯分组不得重复，经典芯与量子芯不得重叠")
 
         self.classical_wave_num = classical_wave_num
@@ -143,7 +151,7 @@ class ClassicalService:
         self.knum = knum
         self.m_cost = np.full((self.MAXINUM, self.MAXINUM, self.knum), np.inf, dtype=float)  # 候选路径总长，km。
         self.m_path = [[[[]for _ in range(self.knum)]for _ in range(self.MAXINUM)]for _ in range(self.MAXINUM)]
-        # 芯轴直接使用 1–7 编号，第 0 项留空且不可分配。
+        # 芯轴直接使用芯编号（七芯 1–7，单芯 1），第 0 项留空且不可分配。
         # 数组轴为 [源节点, 目的节点, 芯, 信道]；状态 0/1/2/3 为不可用/空闲/占用/量子保留。
         self.m_resourceMap = np.zeros((self.MAXINUM, self.MAXINUM,self.core_num + 1, self.WaveNumber), dtype=np.float32)
 
@@ -160,10 +168,11 @@ class ClassicalService:
         self.wave_interval = params.wave_interval
         self.rng = random.Random(params.seed)
 
+        self.single_core_spectrum = params.single_core_spectrum
         self.initialize()
         # bind_six=True 时一个前向请求同步占用前后三芯，共用波长与生命周期。
         self.bind_six = bind_six
-        # 每芯各信道的实际功率（W）；业务导出的 C34 双向固定衰减 10 dB，其余保持设定功率。
+        # 每芯各信道的实际功率（W）；六芯业务导出的 C34 双向固定衰减 10 dB，其余保持设定功率。
         self.channel_launch_powers = np.full(self.WaveNumber, self.launch_power)
         if bind_six:
             self.channel_launch_powers[np.abs(np.asarray(self.available_channel) - 193.4e12) < 1e5] *= 0.1
@@ -180,6 +189,7 @@ class ClassicalService:
         self.allow_bidirectional = params.allow_bidirectional
         self.allocator = ResourceAllocator(
             self.algorithm, forward_groups, backward_groups, self.available_channel,
+            single_core=core_num == 1,
             allow_bidirectional=self.allow_bidirectional,
             paired_groups={forward_groups[0]: backward_groups[0],
                            backward_groups[0]: forward_groups[0]} if bind_six else None)
@@ -199,28 +209,36 @@ class ClassicalService:
             self.max_frequency - w * self.wave_interval
             for w in range(self.quantum_wave_num)
         ]
-        classical_frequencies = []
-        # 单量子、六经典配置在 C35 上方取五个、下方取一个：C34、C36–C40。
-        # 其他规模仍在量子段两侧均分，奇数个信道时低频侧多一个；排除后补足数量。
-        high_count = (5 if self.classical_wave_num == 6 and self.quantum_wave_num == 1
-                      else self.classical_wave_num // 2)
-        # 高频从最高量子频率上方开始；低频从最低量子频率下方开始，避免重叠。
-        for count, index, step in (
-                (high_count, -1, -1),
-                (self.classical_wave_num - high_count, self.quantum_wave_num, 1)):
-            accepted = 0
-            while accepted < count:
-                frequency = self.max_frequency - index * self.wave_interval
-                index += step
-                if frequency <= 0:
-                    raise ValueError("没有足够的正频率可作为经典信道")
-                # 频差小于 100 kHz 视为命中排除频率；保留既有比较容差。
-                if any(abs(frequency - excluded) < 1e5 for excluded in self.excluded_classical_frequencies):
-                    continue
-                classical_frequencies.append(frequency)
-                accepted += 1
+        if self.core_num == 1:
+            # 单芯六路基础集合可增加 C30–C32 成为九路；C35 为量子、C33 留空。
+            classical_frequencies = [193.4e12, 193.6e12, 193.7e12, 193.8e12, 193.9e12, 194.0e12]
+            if self.classical_wave_num == 9:
+                classical_frequencies += [193.0e12, 193.1e12, 193.2e12]
+            if self.single_core_spectrum is not None:
+                classical_frequencies = [(190 + c / 10) * 1e12 for c in SINGLE_CORE_SPECTRA[self.single_core_spectrum]]
+        else:
+            classical_frequencies = []
+            # 单量子、六经典配置在 C35 上方取五个、下方取一个：C34、C36–C40。
+            # 其他规模仍在量子段两侧均分，奇数个信道时低频侧多一个；排除后补足数量。
+            high_count = (5 if self.classical_wave_num == 6 and self.quantum_wave_num == 1
+                          else self.classical_wave_num // 2)
+            # 高频从最高量子频率上方开始；低频从最低量子频率下方开始，避免重叠。
+            for count, index, step in (
+                    (high_count, -1, -1),
+                    (self.classical_wave_num - high_count, self.quantum_wave_num, 1)):
+                accepted = 0
+                while accepted < count:
+                    frequency = self.max_frequency - index * self.wave_interval
+                    index += step
+                    if frequency <= 0:
+                        raise ValueError("没有足够的正频率可作为经典信道")
+                    # 频差小于 100 kHz 视为命中排除频率；保留既有比较容差。
+                    if any(abs(frequency - excluded) < 1e5 for excluded in self.excluded_classical_frequencies):
+                        continue
+                    classical_frequencies.append(frequency)
+                    accepted += 1
         # 数组内顺序即信道编号：量子信道在前，经典信道按频率降序。
-        # 搜索顺序由算法决定：FF/CCA/CQLI 按实际频率升序（故实际从最低频开始），
+        # 搜索顺序由算法决定：单芯 CCA 低频侧低频优先、高频侧及跨侧高频优先；其他 CCA、FF、CQLI 低频优先；
         # SCWA 与 QCNM 按数组内的原索引 0、1、2……升序。
         self.available_channel.extend(sorted(classical_frequencies, reverse=True))
         if min(self.available_channel) <= 0:
@@ -413,8 +431,8 @@ def build_simulation(topology_path, *, algorithm="SCWA", slots=100,
                      classical_channels=10, quantum_channels=1, launch_power=1e-3,
                      link_length_km=None, skip_c33=True,
                      qcnm_noise_rtol=QCNM_NOISE_RTOL, bind_six=False, allow_bidirectional=False, observe_link=None,
-                     observe_link_length_km=None, key_pulses=1e10, key_gamma=5.3):
-    """读取 topology_path 指定的拓扑，返回尚未运行的七芯仿真实例。
+                     observe_link_length_km=None, key_pulses=1e10, key_gamma=5.3, single_core=False, single_core_spectrum=None):
+    """读取 topology_path 指定的拓扑，返回尚未运行的七芯或显式 single_core 单芯实例。
 业务与频率参数沿用 SimulationParameters 的含义，launch_power 使用 W。"""
     # 默认使用拓扑文件的真实边长；显式覆盖只修改内存图，且在计算路由前生效。
     graph = load_topology(topology_path)
@@ -441,14 +459,24 @@ def build_simulation(topology_path, *, algorithm="SCWA", slots=100,
         graph.graph['length_scaling']['observed_edge_override'] = dict(link=list(selected), length_km=selected_length)
     # layout_table 是固定七芯配置表，例如普通算法用 SEVEN_CORE_LAYOUTS；实验表由主控选择。
     layout_table = SEVEN_CORE_EXPERIMENT_LAYOUTS if bind_six else SEVEN_CORE_LAYOUTS
+    if single_core_spectrum is not None and (not single_core or single_core_spectrum not in SINGLE_CORE_SPECTRA):
+        raise ValueError('固定单芯频点方案仅用于 single_core，且必须来自 SINGLE_CORE_SPECTRA')
+    if single_core:
+        allowed_counts = (len(SINGLE_CORE_SPECTRA[single_core_spectrum]),) if single_core_spectrum else (6, 9)
+        if classical_channels not in allowed_counts or quantum_channels != 1 or not skip_c33:
+            raise ValueError('单芯量子必须为 C35，经典数量必须与固定频点方案一致')
+        if bind_six or allow_bidirectional:
+            raise ValueError('单芯模式不支持六芯绑定或双向同频；未建模同频接收干扰')
+        layout_table = SINGLE_CORE_LAYOUTS
     if algorithm not in layout_table:
-        raise ValueError(f"算法 {algorithm} 未配置在当前七芯实验表中")
+        raise ValueError(f"算法 {algorithm} 未配置在当前纤芯表中")
     # core_config 是本次固定配置，例如 FF 的 quantum=(1,)，不根据芯数或列表位置推导布局。
     core_config = layout_table[algorithm]
-    # bind_six 选择实验表的固定三芯方向组；量子芯仍取表中配置，算法只支持七芯。
+    # bind_six 选择七芯实验表的固定三芯方向组；单芯使用独立布局表。
     params = SimulationParameters(
-        core_num=7, Ts=slots, lambda1=arrival_rate, rou1=holding_time, knum=k,
+        core_num=1 if single_core else 7, Ts=slots, lambda1=arrival_rate, rou1=holding_time, knum=k,
         classical_wave_num=classical_channels, quantum_wave_num=quantum_channels,
+        single_core_spectrum=single_core_spectrum,
         max_frequency=193.5e12, wave_interval=100e9, launch_power=launch_power, seed=seed,
         excluded_classical_frequencies_hz=(193.3e12,) if skip_c33 else (),
         qcnm_noise_rtol=qcnm_noise_rtol, allow_bidirectional=allow_bidirectional,
@@ -462,7 +490,8 @@ def build_simulation(topology_path, *, algorithm="SCWA", slots=100,
                            error_opt=0.01, sifting_efficiency=0.5, correct_error_eff=1.15,
                            pulse_count=key_pulses, fluctuation_gamma=key_gamma)
     # 参数定义与单位见 MulticoreFiber；原公式中未确认的单位继续保留待确认说明。
-    fiber = MulticoreFiber(
+    fiber_class = SinglecoreFiber if single_core else MulticoreFiber
+    fiber = fiber_class(
         loss=0.00004605111673958094,
         loss_c=0.00004605111673958094,
         loss_q=0.000046074142297950725,
@@ -473,20 +502,23 @@ def build_simulation(topology_path, *, algorithm="SCWA", slots=100,
         c=299792458,
         e3=6.1796e-14,
         n=1.45,
-        hmn=5e-9,
+        hmn=0 if single_core else 5e-9,
         recapture_factor_Rayleigh=0.0015,
         loss_Rayleigh=0.000032,
         width=2e-10,
         temperature=300.0,  # K，室温近似；不是实验测量值。
     )
-    # 最近邻/次近邻的 hmn 分别为 5e-9/1e-10 m^-1，不是几何函数返回的耦合矩阵。
+    # MCF 最近邻/次近邻 hmn 为 5e-9/1e-10 m^-1；单芯为零，不使用几何耦合矩阵。
     first_fiber = fiber
-    secondary_fiber = replace(fiber, hmn=1e-10)
+    secondary_fiber = fiber if single_core else replace(fiber, hmn=1e-10)
     # 这里只取几何邻接关系；返回的耦合矩阵不参与噪声计算，噪声使用上面的 hmn。
-    first_neighbors, secondary_neighbors, _ = cores_code(
-        params.core_num, core_spacing=10, first_coupling=1e-6,
-        secondary_coupling=1e-7, farthest_coupling=10**(-7.5),
-    )
+    if single_core:
+        first_neighbors, secondary_neighbors = {1: []}, {1: []}
+    else:
+        first_neighbors, secondary_neighbors, _ = cores_code(
+            params.core_num, core_spacing=10, first_coupling=1e-6,
+            secondary_coupling=1e-7, farthest_coupling=10**(-7.5),
+        )
     return ClassicalService(
         graph, params, algorithm=algorithm, core_config=core_config,
         first_fiber=first_fiber, secondary_fiber=secondary_fiber,
@@ -498,7 +530,10 @@ def build_simulation(topology_path, *, algorithm="SCWA", slots=100,
 def comparison_plan(args, default=('QCNM', 'CCA', 'FF'), *, six_core=False):
     """生成算法与单个容忍系数的运行组合，label 用于结果标识，export 标记是否导出。"""
     # supported 是用户可选的导出算法，例如六芯实验仅 CCA/QCNM；FF 只在下方补为内部基准。
-    supported = ('CCA', 'QCNM') if six_core else ALGORITHMS
+    supported = (('CCA', 'QCNM') if six_core else
+                 tuple(SINGLE_CORE_LAYOUTS) if args.single_core else ALGORITHMS)
+    if args.single_core and args.algorithm is None and not six_core:
+        default = ('CCA', 'QCNM')
     selected = list(dict.fromkeys(args.algorithm or default))
     if selected == ['ALL']:
         selected = list(supported)
@@ -520,6 +555,8 @@ def comparison_plan(args, default=('QCNM', 'CCA', 'FF'), *, six_core=False):
 def main(argv=None):
     """解析命令行并选择单次运行、负载/功率/距离扫描或业务回放导出；ALL 的算法范围随模式而定。"""
     parser = argparse.ArgumentParser(description="多芯光纤 QKD 共纤资源分配仿真")
+    parser.add_argument('--single-core', action='store_true',
+                        help='独立单芯共纤模式：CCA/QCNM/FF，量子经典共芯，双向请求共享容量；默认仍为七芯')
     parser.add_argument("--topology", choices=("topology1", "topology6", "topology7"), default="topology7")
     parser.add_argument('--observe-link', type=int, nargs=2, metavar=('U', 'V'),
                         help='只观测此无向链路，节点从0编号；默认观测拓扑中的最短边（同长按节点编号排序），全网照常分配')
@@ -536,9 +573,9 @@ def main(argv=None):
     parser.add_argument("--k", type=int, default=1, help="每对节点保留的候选路径数，默认1")
     parser.add_argument("--seed", type=int, default=42, help="业务序列随机种子，默认42；多个种子用 42 43 44")
     parser.add_argument("--classical-channels", type=int, default=None,
-                        help="经典候选信道数：普通运行默认10；单量子六经典使用C34、C36–C40，其他规模两侧均分并跳过C33")
+                        help="经典候选信道数：单芯默认6、可选9（增加C30–C32），固定方案由 --single-core-spectrum 自动确定；MCF普通运行默认10，六芯导出固定6")
     parser.add_argument("--quantum-channels", type=int, default=1, help="量子候选信道数，默认1")
-    parser.add_argument("--include-c33", action="store_true", help="允许低频侧使用C33，保留两侧分布及经典信道总数")
+    parser.add_argument("--include-c33", action="store_true", help="普通MCF允许低频侧使用C33；单芯及业务导出不支持")
     parser.add_argument("--launch-power-dbm", type=float, default=10, help="普通运行的每芯每经典信道发射功率/dBm，默认10")
     parser.add_argument("--link-length-km", type=float, default=None,
                         help="把全网每条边的长度统一覆盖为该值/km，用于受控敏感性实验；默认使用拓扑文件中的实际边长")
@@ -551,17 +588,17 @@ def main(argv=None):
     parser.add_argument("--scan-all", action="store_true", help="一次运行负载、功率、距离三组独立扫描")
     parser.add_argument("--distances", type=float, nargs="+", help="距离扫描点/km，默认 1 5 10 20 30 40 50")
     parser.add_argument("--loads", type=float, nargs="+", default=None,
-                        help="普通扫描为双向合计负载；实验导出为前向配对请求负载/Erlang，默认2.5 5 7.5 10 12.5 15 17.5 20；显式值不再减半")
+                        help="普通/单芯为双向合计负载；六芯导出为配对请求负载/Erlang；显式值不减半")
     parser.add_argument("--seeds", type=int, nargs="+", default=None,
                         help="扫描种子列表；省略时仅使用 --seed")
     parser.add_argument("--warmup", type=int, default=None, help="扫描预热时隙，默认10")
     parser.add_argument("--scan-scenarios", nargs="+", default=None, metavar="KM:DBM",
                         help="全网边长与每信道功率配对，例如 1:13.5 10:10.5；不指定则使用单次参数")
     parser.add_argument("--output-dir", type=Path, default=None, help="扫描输出目录，默认 results/traffic_scan_时间戳")
-    parser.add_argument("--export-business", action="store_true", help="运行 CCA、QCNM 的负载/功率两组仿真并导出回放；配合 --experiment-duration-seconds 直接映射为秒")
-    parser.add_argument("--powers", type=float, nargs='+', help="功率扫描点，默认 7 8 9 10 10.5 dBm")
-    parser.add_argument("--fixed-load", type=float, default=None, help="固定负载/Erlang：普通扫描默认10，实验导出默认5对；显式值不再减半")
-    parser.add_argument("--fixed-power", type=float, default=10.5, help="实验负载扫描的固定每芯每信道功率/dBm")
+    parser.add_argument("--export-business", action="store_true", help="单芯与MCF共用：--loads配--fixed-power，--powers配--fixed-load，运行两组独立扫描并导出回放、Excel及图表")
+    parser.add_argument("--powers", type=float, nargs='+', help="功率扫描点/dBm，使用 --fixed-load 的负载；默认 7 8 9 10 10.5")
+    parser.add_argument("--fixed-load", type=float, default=None, help="固定负载/Erlang：普通扫描默认10，导出默认5；单芯为双向合计，六芯为业务对")
+    parser.add_argument("--fixed-power", type=float, default=10.5, help="--export-business 中 --loads 扫描的固定每芯每信道功率/dBm")
     parser.add_argument('--qcnm-noise-rtol', dest='qcnm_noise_rtol',
                         type=float, nargs='+', default=None,
                         help=('QCNM 相对噪声增量容差，须为有限非负数，可多选且可大于1；'
@@ -575,9 +612,16 @@ def main(argv=None):
                         help='每份业务回放的总时长/秒（包含同比例预热）；export-business 中直接完成映射，省略则保留仿真时间单位')
     parser.add_argument('--reexport-traffic', type=Path, default=None,
                         help='离线重导出现有业务JSON，不运行仿真；配合实验秒数和output-dir')
+    parser.add_argument('--single-core-spectrum', choices=tuple(SINGLE_CORE_SPECTRA),
+                        help='单芯固定候选频点：high6、加 C35.5 的 high7、延伸至 C40.5 的 high10 或 low6；自动确定经典信道数')
     args = parser.parse_args(argv)
+    if args.single_core_spectrum:
+        count = len(SINGLE_CORE_SPECTRA[args.single_core_spectrum])
+        if not args.single_core or args.classical_channels not in (None, count):
+            parser.error('--single-core-spectrum 需要单芯模式且经典数量与方案一致')
+        args.classical_channels = count
     if args.classical_channels is None:
-        args.classical_channels = 6 if args.export_business else 10
+        args.classical_channels = 6 if args.single_core else (6 if args.export_business else 10)
     if args.experiment_duration_seconds is not None:
         if not math.isfinite(args.experiment_duration_seconds) or args.experiment_duration_seconds <= 0:
             parser.error('--experiment-duration-seconds 必须为有限正数')
@@ -676,7 +720,7 @@ def main(argv=None):
             qcnm_noise_rtol=variant["qcnm_noise_rtol"] or 0.0, allow_bidirectional=args.allow_bidirectional,
             observe_link=args.observe_link,
             observe_link_length_km=args.observe_link_length_km,
-            key_pulses=args.key_pulses, key_gamma=args.key_gamma,
+            key_pulses=args.key_pulses, key_gamma=args.key_gamma, single_core=args.single_core, single_core_spectrum=args.single_core_spectrum,
         )
         row = sim.run()
         row.update(algorithm=label, qcnm_noise_rtol=variant["qcnm_noise_rtol"])

@@ -1,8 +1,8 @@
 """供调用方使用 ResourceAllocator(...).allocate(...)，从资源与功率状态选择共同信道和逐跳芯组。
-仅支持固定七芯配置，返回分配结果而不修改资源。"""
+支持固定七芯配置及显式单芯共纤模式，返回分配结果而不修改资源。"""
 import numpy as np
 
-from core_layout import SEVEN_CORE_LAYOUTS
+from core_layout import SEVEN_CORE_LAYOUTS, SINGLE_CORE_LAYOUTS
 from skr_calculation import calculate_quantum_noise_components
 
 
@@ -20,6 +20,7 @@ class ResourceAllocator:
             backward_groups,       # 后向候选组，例如 [(3,), (5,)] 或 [(3, 5, 7)]。
             frequencies,           # 信道索引对应的频率（Hz），例如 [193.5e12, 193.4e12]。
             *,
+            single_core=False,  # True 使用固定单芯共纤布局；默认七芯布局保持不变。
             allow_bidirectional=False,  # 是否允许同一纤芯、同一信道内双向同频数据信号同时传输；默认 False（不允许）。
             paired_groups=None,    # 可选反向绑定表，如 {(2,3,4):(5,6,7), (5,6,7):(2,3,4)}；由主控提供。
             # 芯是否能承载某方向由前后向候选列表决定；双向共有芯仍可波长 1 正向、波长 2 反向，本开关只约束同频。
@@ -37,13 +38,20 @@ class ResourceAllocator:
         self.backward_groups = tuple(tuple(group) for group in backward_groups)
         if any(not group for group in self.forward_groups + self.backward_groups):
             raise ValueError('候选芯组不能为空')
-        # layout 为本算法的固定七芯配置，例如 SEVEN_CORE_LAYOUTS['SCWA']。
-        layout = SEVEN_CORE_LAYOUTS[self.algorithm]
+        # layout 为本算法当前模式的固定配置；单芯只允许 CCA、QCNM、FF。
+        layouts = SINGLE_CORE_LAYOUTS if single_core else SEVEN_CORE_LAYOUTS
+        if self.algorithm not in layouts:
+            raise ValueError('单芯共纤仅支持 CCA、QCNM、FF')
+        layout = layouts[self.algorithm]
+        self.core_count = 1 if single_core else 7
+        # 单芯第 0 项为唯一量子频率；低频侧集合低频优先，高频侧及既有跨侧集合高频优先。
+        self.cca_frequency_order = ('descending' if single_core and
+                                    np.any(self.frequencies[1:] > self.frequencies[0]) else 'ascending')
         # groups/allowed 为方向候选及固定允许芯，例如 ((6,), (5,), (7,)) / (6,5,7)。
         for groups, allowed in ((self.forward_groups, layout['classical_forward']),
                                 (self.backward_groups, layout['classical_backward'])):
             if any(core not in allowed for group in groups for core in group):
-                raise ValueError('候选芯组必须落在本算法的固定七芯配置内')
+                raise ValueError('候选芯组必须落在本算法当前模式的固定配置内')
         # 按固定表顺序排列候选；绑定约束不改变算法的芯搜索次序。
         self.forward_groups = tuple(sorted(self.forward_groups, key=lambda group: tuple(
             layout['classical_forward'].index(core) for core in group)))
@@ -71,8 +79,8 @@ class ResourceAllocator:
         """返回 (逐跳芯组列表, 共同信道索引)，例如 ([[2], [4]], 3)；无可用分配返回 (None, -1)。"""
         # QCNM 必须显式传入专用参数；缺参或向其他算法传入专用参数，由对应方法签名报 TypeError。
         # resources 的 0/1/2/3 表示不可用/空闲经典/占用经典/量子保留；芯轴第 0 项留空，芯号直接作为下标。
-        if resources.ndim != 4 or resources.shape[2] != 8:
-            raise ValueError('资源分配算法只支持固定七芯布局')
+        if resources.ndim != 4 or resources.shape[2] != self.core_count + 1:
+            raise ValueError('资源数组与所选固定纤芯布局不一致')
         if len(path) < 2:
             return None, -1
         if len(set(path)) != len(path):
@@ -99,14 +107,14 @@ class ResourceAllocator:
     # 算法缩写：CQLI 为 Classical and quantum signal layered interleaved（经典量子信号分层交错资源分配），
     # CCA 为 Conventional channel allocation（传统信道分配方案），
     # FF 为 first-fit（首次适配），SCWA 为 Synergistic core and wavelength allocation（协同纤芯波长分配方案）；
-    # 芯分组全部取固定七芯表。
+    # 芯分组全部取当前模式的固定芯表。
     def _cqli(self, path, launch_power, resources, powers, distances):
         """CQLI（经典量子信号分层交错资源分配）按低频优先搜索，同频按固定芯表顺序选择候选，例如先 (2,) 后 (4,)。"""
         return self._first_fit(path, resources, sort_groups=False)
 
     def _cca(self, path, launch_power, resources, powers, distances):
-        """CCA（Conventional channel allocation，传统信道分配方案）按低频优先搜索，同频按固定芯表顺序选择候选。"""
-        return self._first_fit(path, resources, sort_groups=False)
+        """CCA 单芯按候选频点所在侧排序，七芯保持低频优先；同频按固定芯表顺序选择候选。"""
+        return self._first_fit(path, resources, sort_groups=False, high_first=self.cca_frequency_order == "descending")
 
     def _ff(self, path, launch_power, resources, powers, distances):
         """FF（first-fit，首次适配）按低频、组内芯编号排序搜索，例如 (2,) 先于 (4,)。"""
@@ -220,6 +228,7 @@ class ResourceAllocator:
             if sum(candidate['noise'] for candidate in chosen) > limit:
                 chosen = original
             # neighbor_count 为各跳邻芯占用总数，例如 2；chosen_groups 为逐跳芯组，例如 [(2,), (1,)]。
+            # 单芯无邻芯，计数恒零，因此容差不改变最终最低新增噪声选择。
             neighbor_count = sum(candidate['neighbors'] for candidate in chosen)
             chosen_groups = [candidate['cores'] for candidate in chosen]
             # key 按邻芯数、噪声、原信道索引、芯编号排序，例如 (2, 1e-12, 3, ((2,), (1,)))。
@@ -234,11 +243,12 @@ class ResourceAllocator:
         # wave 为原信道索引，例如 3；同频时按该索引升序破同分。
         return sorted(range(resources.shape[-1]), key=lambda wave: (self.frequencies[wave], wave))
 
-    def _first_fit(self, path, resources, *, sort_groups):
-        """按低频优先寻找全路径首个可用共同信道，返回逐跳芯组；失败返回 (None, -1)。"""
+    def _first_fit(self, path, resources, *, sort_groups, high_first=False):
+        """寻找全路径首个可用共同信道；high_first=True 高频优先，默认低频优先，失败返回 (None, -1)。"""
         # path/resources 同 allocate；sort_groups=True 按芯编号排序候选组。
         # wave 为原信道索引，例如 3；chosen_groups 为当前已选芯组，例如 [(2,), (4,)]。
-        for wave in self._frequency_order(resources):
+        order = self._frequency_order(resources)
+        for wave in reversed(order) if high_first else order:
             chosen_groups = []
             # a/b 为当前跳起止节点，例如 0/1；groups 为该方向候选，例如 ((2,), (4,))。
             for a, b in zip(path, path[1:]):

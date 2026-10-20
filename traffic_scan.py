@@ -53,6 +53,19 @@ def create_config(args, sim, *, algorithm_labels, warmup, seeds, loads, powers,
         python=platform.python_version(),
         dependencies={name: version(name) for name in ('numpy', 'pandas', 'networkx', 'openpyxl', 'matplotlib')},
         source_sha256=source_hashes(Path(__file__).resolve().parent, args.topology))
+    if args.single_core:
+        config.update(single_core=True, core_count=1,
+                      single_core_spectrum=args.single_core_spectrum,
+                      cca_frequency_order=(sim.allocator.cca_frequency_order if sim is not None else
+                                           "ascending" if args.single_core_spectrum == "low6" else "descending"),
+                      channel_spacing_definition="grid_resolution; actual gaps follow classical_frequencies_hz",
+                      channel_spacing_hz=50e9 if args.single_core_spectrum else 100e9,
+                      quantum_noise_model='intracore_raman_fwm_rayleigh_v1',
+                      osnr_model='single_core_fixed_floor_only_v1',
+                      synergy_model=None,
+                      fwm_assumptions='undepleted copolarized pumps; same-direction mixing; single Rayleigh return',
+                      raman_propagation='intracore forward/backward attenuation integrals')
+        config['raman_model']['propagation'] = config['raman_propagation']
     if sim is not None:
         config.update(
             traffic_mode='forward_requests_with_paired_reverse' if sim.bind_six else 'independent_directions',
@@ -356,7 +369,7 @@ def run_load_scan(args, build_simulation, base, *, variants):
                         skip_c33=not args.include_c33,
                         allow_bidirectional=args.allow_bidirectional, qcnm_noise_rtol=variant["qcnm_noise_rtol"] or 0.0, observe_link=args.observe_link,
                         observe_link_length_km=args.observe_link_length_km,
-                        key_pulses=args.key_pulses, key_gamma=args.key_gamma)
+                        key_pulses=args.key_pulses, key_gamma=args.key_gamma, single_core=args.single_core, single_core_spectrum=args.single_core_spectrum)
                     # 逐算法只记录会随算法变化的物理配置，公共模型参数见顶层 metadata。
                     config_key = f'{scenario_index}:{label}'
                     if config_key not in configurations:
@@ -427,20 +440,23 @@ def summarize_business(runs):
 
 
 def run_business_export(args, build_simulation, base, *, variants):
-    """运行六芯绑定业务并导出所选链路回放，返回批次索引。
-负载按前向配对请求计数，每个请求同波长占用前后三芯；C34 每芯功率比输入值低 10 dB，其余保持输入值。"""
+    """运行六芯配对或单芯独立双向业务，导出链路回放及批次索引。
+六芯按业务对计负载且 C34 衰减 10 dB；单芯按双向合计请求计负载，经典信道等功率。"""
+    # 两种模式共用两组独立扫描：loads 配 fixed_power，powers 配 fixed_load；不生成负载与功率的笛卡尔积。
+    # args 均来自 main.py 命令行；两组回放写入同一批次的 load_scan/、power_scan/，汇总导出也共用。
     # 在仿真前检查工作簿和图表所需依赖。
     import openpyxl  # noqa: F401
     import matplotlib  # noqa: F401
 
     if args.scan_load or args.scan_scenarios:
         raise ValueError('--export-business 不与统计扫描模式同时使用')
-    if args.classical_channels != 6:
-        raise ValueError('六芯实验固定使用6个经典信道')
-    # 六芯实验固定量子 C35，经典 C34、C36–C40；频率由主控的六信道规则生成。
+    allowed_channels = (6, 7, 9, 10) if args.single_core else (6,)
+    if args.classical_channels not in allowed_channels:
+        raise ValueError(f'当前实验模式允许的经典信道数为 {allowed_channels}')
+    # 量子固定 C35；主控选择六芯的六频点集合或单芯的固定频点集合。
     if args.quantum_channels != 1 or args.include_c33:
         raise ValueError('实验业务导出使用 C35 量子信道，经典信道跳过 C33')
-    # 旧双向独立请求改为一条前向配对请求，默认到达负载减半一次；显式负载即实际配对请求负载。
+    # 六芯按配对请求计负载，单芯按双向合计独立请求计负载；显式数值不换算。
     loads, seeds, warmup, _ = scan_settings(args)
     if args.loads is None:
         loads = [2.5, 5, 7.5, 10, 12.5, 15, 17.5, 20]
@@ -463,7 +479,8 @@ def run_business_export(args, build_simulation, base, *, variants):
     experiments = [('load_scan', load, args.fixed_power) for load in loads]
     experiments += [('power_scan', fixed_load, power) for power in sorted(powers)]
     # manifest 汇总本批次文件、单次指标与跨种子统计；回放格式与文件命名见 traffic_export 模块说明。
-    manifest = dict(description='Six-core paired experiment batch: per-run channel replay, config and summary',
+    manifest = dict(description=('Single-core independent-direction experiment batch' if args.single_core
+                                else 'Six-core paired experiment batch: per-run channel replay, config and summary'),
                     config='config.json', files=[], artifacts=[])
     # 六芯导出仅选择 CCA/QCNM；主控补跑的 FF 仅用于配对基准，不导出其回放或曲线。
     references, runs = {}, []
@@ -480,9 +497,9 @@ def run_business_export(args, build_simulation, base, *, variants):
                     classical_channels=args.classical_channels, quantum_channels=1,
                     launch_power=1e-3 * 10 ** (power / 10), link_length_km=args.link_length_km,
                     skip_c33=True,
-                    allow_bidirectional=args.allow_bidirectional, qcnm_noise_rtol=variant["qcnm_noise_rtol"] or 0.0, bind_six=True, observe_link=args.observe_link,
+                    allow_bidirectional=args.allow_bidirectional, qcnm_noise_rtol=variant["qcnm_noise_rtol"] or 0.0, bind_six=not args.single_core, observe_link=args.observe_link,
                         observe_link_length_km=args.observe_link_length_km,
-                        key_pulses=args.key_pulses, key_gamma=args.key_gamma)
+                        key_pulses=args.key_pulses, key_gamma=args.key_gamma, single_core=args.single_core, single_core_spectrum=args.single_core_spectrum)
                 if config_sim is None and variant['export']:
                     config_sim = sim
                 algorithm_layouts[algorithm] = dict(

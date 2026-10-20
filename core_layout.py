@@ -1,4 +1,4 @@
-"""供 main 和 algorithm 导入固定七芯配置，并由 cores_code 将芯数、间距和耦合系数转换为邻芯表与矩阵。
+"""供 main 和 algorithm 导入固定七芯及单芯配置，并由 cores_code 将芯数、间距和耦合系数转换为邻芯表与矩阵。
 几何函数支持 19/37 芯，不代表算法支持这些芯数。"""
 
 import math
@@ -61,6 +61,12 @@ SEVEN_CORE_EXPERIMENT_LAYOUTS = {
         classical_backward=(3, 7, 1),
         quantum=(2,),
     ),
+}
+
+# 单芯共纤只使用芯 1，量子和经典在不同频点共芯；两个方向共享经典容量。
+SINGLE_CORE_LAYOUTS = {
+    name: dict(classical_forward=(1,), classical_backward=(1,), quantum=(1,))
+    for name in ('CCA', 'QCNM', 'FF')
 }
 
 

@@ -302,6 +302,60 @@ class MulticoreFiber:
         return 'Multicore, hmn={}/m'.format(self.hmn)
 
 
+@dataclass(frozen=True)
+class SinglecoreFiber(MulticoreFiber):
+    """单芯共纤的弱非线性模型；沿用拉曼谱，使用芯内传播积分，不含芯间耦合。
+    FWM 假设泵浦不耗尽、同偏振；忽略混合传播方向的相位失配项及器件泄漏。"""
+    n2: float = 2.6e-20  # 石英非线性折射率的模型假定，m²/W，未作实验标定。
+
+    def __post_init__(self):
+        """核查公共光纤参数及单芯非线性折射率。"""
+        super().__post_init__()
+        if self.n2 <= 0 or self.hmn != 0:
+            raise ValueError('单芯模型要求 n2 > 0 且芯间耦合 hmn = 0')
+
+    def get_forward_raman_scatter(self, p, z, eta):
+        """返回芯内前向拉曼功率（W），p 为输入 W，z 为 m，eta 为 m^-2。"""
+        # ∫exp(-αc x-αq(L-x))dx；等衰减极限为 L exp(-αL)。
+        # 等衰减参考：https://www.nature.com/articles/s41598-018-21418-6
+        delta = self.loss_q - self.loss_c
+        integral = z if delta == 0 else np.expm1(delta * z) / delta
+        return p * eta * self.width * np.exp(-self.loss_q * z) * integral
+
+    def get_backward_raman_scatter(self, p, z, eta):
+        """返回芯内后向拉曼功率（W）；沿反向泵浦输入端积分往返衰减。"""
+        attenuation = self.loss_c + self.loss_q
+        return p * eta * self.width * (-np.expm1(-attenuation * z)) / attenuation
+
+    def get_intracore_four_wave_mixing(self, fi, fj, fk, pi, pj, pk, beta, z):
+        """返回同向芯内 FWM 频率（Hz）和功率（W）；其余输入与公共 FWM 接口一致。"""
+        # P = d²γ²PiPjPk exp(-αL)|∫exp((-α+iβ)x)dx|²；d 为 1 或 2。
+        # 参考：https://grouper.ieee.org/groups/802/3/ca/public/meeting_archive/2016/07/liu_3ca_1_0716.pdf
+        frequency = fi + fj - fk
+        degeneracy = 1 if abs(fi - fj) < 1e6 else 2
+        gamma = 2 * np.pi * self.n2 * frequency / (self.c * self.A_eff)
+        integral = np.expm1((-self.loss + 1j * beta) * z) / (-self.loss + 1j * beta)
+        power = (degeneracy * gamma)**2 * pi * pj * pk * np.exp(-self.loss * z) * abs(integral)**2
+        return frequency, power
+
+    def get_backward_intracore_four_wave_mixing(self, fi, fj, fk, pi, pj, pk, beta, z):
+        """返回反向泵浦生成的 FWM 经一次瑞利回散抵达量子接收端的近似功率（W）。"""
+        # 自行积分推导：r αR ∫P_FWM(x)exp(-αx)dx；不把反向生成光直接当作到达接收端。
+        # 只计已生成 FWM 的一次回散，不含回散泵浦参与的混频和多次散射。
+        frequency = fi + fj - fk
+        degeneracy = 1 if abs(fi - fj) < 1e6 else 2
+        gamma = 2 * np.pi * self.n2 * frequency / (self.c * self.A_eff)
+        alpha = self.loss
+        integral = (-np.expm1(-2 * alpha * z) / (2 * alpha)
+                    - np.expm1(-4 * alpha * z) / (4 * alpha)
+                    - 2 * np.real(np.expm1((-3 * alpha + 1j * beta) * z)
+                                  / (-3 * alpha + 1j * beta)))
+        power = ((degeneracy * gamma)**2 * pi * pj * pk
+                 * self.recapture_factor_Rayleigh * self.loss_Rayleigh
+                 * np.maximum(integral, 0) / (alpha**2 + beta**2))
+        return frequency, power
+
+
 # 经典 OSNR 模型版本，随结果导出，便于判断历史结果的公式口径。
 OSNR_MODEL_VERSION = 'shared_fiber_icxt_v2'
 
@@ -367,6 +421,11 @@ def calculate_intercore_noise_components(fiber, frequencies, powers, quantum_fre
                       else fiber.get_inter_forward_raman_scatter)
     fwm_function = (fiber.get_backward_intercore_four_wave_mixing if backward
                     else fiber.get_intercore_four_wave_mixing)
+    if isinstance(fiber, SinglecoreFiber):
+        raman_function = (fiber.get_backward_raman_scatter if backward
+                          else fiber.get_forward_raman_scatter)
+        fwm_function = (fiber.get_backward_intracore_four_wave_mixing if backward
+                        else fiber.get_intracore_four_wave_mixing)
     raman = fiber.get_raman_power(frequencies, powers, quantum_frequencies, raman_function, z)
     fwm = fiber.get_fwm_power(frequencies, powers, quantum_frequencies, fwm_function, z)[1]
     return raman, fwm

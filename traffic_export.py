@@ -20,6 +20,7 @@ quantum_frequencies_hz 单独记录量子频率，经典候选列表保持仿真
 纤芯从 1 编号：中心为 1，外围从顶部顺时针为 2–7。
 forward_cores/backward_cores 给出本次仿真实际使用的方向纤芯，供实验端与自身设置核对是否一致。
 六芯模式每个前向请求绑定三芯前向和三芯后向，两方向信道列表始终相同；后向光计入物理噪声。
+单芯模式前后向芯均为 [1]，业务独立，两方向信道可不同但禁止双向同频。
 某一时刻未出现在列表里的信道即该时刻不应有波长。states 按事件发生顺序排列，同时刻事件保持原顺序。
 """
 from copy import deepcopy
@@ -35,12 +36,12 @@ from skr_calculation import skr_model_config
 
 
 class TrafficRecorder:
-    """观察已完成事件并记录所选链路的资源归属，生成六芯配对业务回放。"""
+    """观察事件并记录有向链路的资源归属，生成六芯或单芯业务回放。"""
 
     def __init__(self, sim):
-        """接收六芯实例 sim，按其观测链路的前后向芯建立占用记录。"""
-        if not sim.bind_six:
-            raise ValueError('业务回放要求六芯配对实验实例')
+        """接收六芯或单芯实例 sim，按观测链路两个方向分别建立占用记录。"""
+        if not sim.bind_six and sim.core_num != 1:
+            raise ValueError('业务回放要求六芯配对或单芯共纤实例')
         self.sim = sim
         a, b = sim.observed_link
         self.links = [(a, b), (b, a)]
@@ -70,7 +71,8 @@ class TrafficRecorder:
             if arrival:
                 # 到达先登记本次占用，离去事件按业务编号取回同一份芯组与信道。
                 self.active[bid] = dict(
-                    cores=[list(cores) for a, b, cores in self.sim.event_resources(event)
+                    slots=[(self.link_index[(a, b)], np.atleast_1d(cores).tolist())
+                           for a, b, cores in self.sim.event_resources(event)
                            if (a, b) in self.link_index], wave=int(event.m_ocuppiedwave))
                 self._update(bid, self.active[bid], 'arrival')
             else:
@@ -83,19 +85,15 @@ class TrafficRecorder:
         self._check_state()
 
     def _update(self, bid, service, kind):
-        """回放六芯归属一起更新；到达须空闲，离去须属于同一组，否则报错。"""
+        """按 service 的方向和芯组更新归属；到达须空闲，离去须属于业务 bid。"""
         wave = service['wave'] - self.sim.quantum_wave_num
-        for cores in service['cores']:
+        for direction, cores in service['slots']:
             for core in cores:
-                row = self.occupancy[self._direction(core)][core]
+                row = self.occupancy[direction][core]
                 expected = -1 if kind == 'arrival' else bid
                 if row[wave] != expected:
                     raise ValueError('回放归属与仿真生命周期不一致')
                 row[wave] = bid if kind == 'arrival' else -1
-
-    def _direction(self, core):
-        """返回该芯所属的观测链路下标：0 为前向（节点号小到大），1 为后向。"""
-        return 0 if core in self.sim.classical_forward_cores else 1
 
     def _carried(self, link_index):
         """返回该方向上当前被业务占用的信道编号列表，按编号升序；芯号不导出。
@@ -117,12 +115,14 @@ class TrafficRecorder:
                     forward_channels=forward, backward_channels=backward)
 
     def _check_state(self):
-        """只读核查六芯同属一条业务、两方向信道一致及实际每芯功率。"""
+        """核查回放与资源及功率一致；六芯需配对，单芯检查双向同频冲突。"""
         sim = self.sim
         forward = np.asarray(self.occupancy[0])[sim.classical_forward_cores[0]]
         backward = np.asarray(self.occupancy[1])[sim.classical_backward_cores[0]]
-        if not np.array_equal(forward, backward):
+        if sim.bind_six and not np.array_equal(forward, backward):
             raise ValueError('六芯回放的前后向业务归属不一致')
+        if sim.core_num == 1 and not sim.allow_bidirectional and np.any((forward >= 0) & (backward >= 0)):
+            raise ValueError('单芯回放出现双向同频占用')
         for index, (a, b) in enumerate(self.links):
             resources = sim.m_resourceMap[a, b, :, sim.quantum_wave_num:]
             powers = sim.P_link[a, b, :, sim.quantum_wave_num:]
@@ -149,8 +149,9 @@ class TrafficRecorder:
                 self.trace.append(final)
             self.active.clear()
         return dict(forward_cores=list(self.sim.classical_forward_cores),
-                    traffic_mode='forward_requests_with_paired_reverse',
-                    bound_cores_per_hop=6,
+                    traffic_mode=('forward_requests_with_paired_reverse' if self.sim.bind_six
+                                  else 'independent_directions'),
+                    bound_cores_per_hop=6 if self.sim.bind_six else 1,
                     skr_model=skr_model_config(self.sim.bb84_params, self.sim.detector_params),
                     backward_cores=list(self.sim.classical_backward_cores),
                     quantum_frequencies_hz=[float(f) for f in self.sim.available_channel[:self.sim.quantum_wave_num]],
@@ -389,6 +390,12 @@ def export_business_summary(output, runs, metadata, summary):
          f"Load sweep | {metadata['fixed_power_dbm']:g} dBm/core/channel"),
         ('power_scan', '功率扫描', 'power_dbm', 'Power per core per channel (dBm)',
          f"Power sweep | {metadata['fixed_load_erlang']:g} Erlang of six-core pairs")]
+    if metadata.get('single_core'):
+        specs = [
+            ('load_scan', '负载扫描', 'load_erlang', 'Bidirectional offered traffic (Erlang)',
+             f"Single-core load sweep | {metadata['fixed_power_dbm']:g} dBm/channel"),
+            ('power_scan', '功率扫描', 'power_dbm', 'Power per channel (dBm)',
+             f"Single-core power sweep | {metadata['fixed_load_erlang']:g} Erlang")]
     algorithms = list(dict.fromkeys(r['algorithm'] for r in runs))
     colors = {name: plt.get_cmap('tab10')(i % 10) for i, name in enumerate(algorithms)}
     # 工作簿只保留两张汇总表，不嵌图；完整配置、种子与样本仍在 JSON 中。
